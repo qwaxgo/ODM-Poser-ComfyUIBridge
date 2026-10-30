@@ -1,36 +1,37 @@
 # SymbolicPoseEditor-ComfyUIBridge
 
-The ComfyUI bridge for the Symbolic Pose Editor (ComfyUI-SymbolicPoseEditor), as a mod. Private.
+記号ポーズエディタを ComfyUI のノードとして使うための部品です（非公開）。
 
-`comfyui.js` connects the editor to the **Symbolic Pose Editor** node:
+## これは何か
 
-- Confirm / Cancel at the top of the side bar: Confirm sends the pose, the scene, the rough and
-  OpenPose pictures and the export size to the node (`symbolic-pose-confirmed`); Cancel closes.
-- When the node opens the editor, the pose it holds is loaded (`symbolic-pose-ready` →
-  `symbolic-pose-load`).
-- The user presets of the node's `user_presets/*.json` appear in the editor.
+ポーズエディタ本体は、ComfyUI がなくても動く単体の道具です。このリポジトリの `comfyui.js` は、
+エディタとノード「Symbolic Pose Editor」の間をつなぐ部品（MOD）です。入れると、次のことができるようになります。
 
-Messages go only to the page's own origin. Opened from disk (without ComfyUI) it does nothing.
-The other side is `web/js/symbolic_pose_editor.js` in the node's repository.
+- ノードから開いたエディタに「確定して閉じる」「閉じる」ボタンが出る
+- 「確定して閉じる」を押すと、作ったポーズ・アタリ画像・OpenPose 画像・画像の大きさがノードに送られる
+- 次にノードからエディタを開くと、前に確定したポーズから続けられる
+- ノードの `user_presets/` に置いたプリセットが、エディタの一覧に出る
 
-## Install
+入れないと、ノードからエディタは開きますが、ボタンが出ず、ポーズをノードに送れません。
+ComfyUI を使わずにエディタを直接開いたときは、この部品は何もしません。
 
-Clone this repository into the node's `mods/` folder and restart ComfyUI once:
+## 入れ方
+
+導入の手順はノードのリポジトリの **`docs/COMFYUI-JA.md`** にまとめてあります。要点だけ書くと：
 
 ```
 cd ComfyUI/custom_nodes/ComfyUI-SymbolicPoseEditor/mods
 git clone git@github.com:qwaxgo/SymbolicPoseEditor-ComfyUIBridge.git
 ```
 
-Without it the editor still opens in the node, but cannot hand the pose back (ComfyUI's console
-says so at start). `?nomods` in the editor's address turns it off too.
+そのあと ComfyUI を一度再起動します。
 
-Uses MOD API 1.1 (`api.io`, `api.ui.addSection({at: "top"})`, `api.presets`): see
-`docs/MODDING.md` in the node's repository.
+## English
 
-## 日本語
-
-記号ポーズエディタを ComfyUI のノードとつなぐ MOD（非公開）。ノードの `mods/` にこのリポジトリを clone して ComfyUI を
-一度再起動すると、エディタの上に「確定して閉じる／閉じる」が出て、確定したポーズ・アタリ画像・OpenPose 画像・書き出しの
-大きさがノードに渡ります。ノードが持っていたポーズで開き、`user_presets/` のユーザープリセットも読み込みます。
-これがないとエディタはノードの中で開きますが、ポーズをノードに返せません。
+The piece that connects the Symbolic Pose Editor to its ComfyUI node (private). With it, the editor
+opened from the node gets Confirm / Cancel buttons; Confirm sends the pose, the rough and OpenPose
+pictures and the size to the node, the editor reopens on the confirmed pose, and the node's
+`user_presets/` appear in the editor. Without it the editor opens but cannot send anything back.
+Install: clone this repository into the node's `mods/` folder and restart ComfyUI once; the full
+guide is `docs/COMFYUI.md` in the node's repository. It uses MOD API 1.1 (`api.io`, `api.ui`,
+`api.presets`); messages go only to the page's own origin.
