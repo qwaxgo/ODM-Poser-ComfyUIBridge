@@ -1,5 +1,5 @@
-// The ComfyUI hand-off, as a mod (its own repository, cloned into the editor's mods/). Inside
-// ComfyUI the node serves it with the other mods; opened from disk it does nothing (no node_id).
+// The editor's side of the ComfyUI hand-off, as a mod of ODM Poser. The node (this repository's
+// routes.py) serves it first of all mods ("_bridge/comfyui.js"); outside ComfyUI it does nothing.
 //   - user presets: user_presets/*.json, merged by the node into /odm_poser/user_presets.js
 //   - the node's modal (?node_id=... in an iframe): it sends the pose it has ("odm-poser-load")
 //     once the editor says "odm-poser-ready"; "Confirm" sends the pose, the scene, both

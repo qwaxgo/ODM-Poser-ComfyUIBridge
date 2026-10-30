@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+# this machine's settings (config.example.json shows them)
+config.json
+# your own preset files and mods stay on your machine
+user_presets/*
+!user_presets/README.md
+mods/*
+!mods/README.md
