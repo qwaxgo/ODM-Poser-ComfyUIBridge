@@ -1,3 +1,6 @@
 [submodule "editor"]
 	path = editor
 	url = https://github.com/qwaxgo/ODM-Poser.git
+[submodule "design/melta-ui"]
+	path = design/melta-ui
+	url = https://github.com/tsubotax/melta-ui
