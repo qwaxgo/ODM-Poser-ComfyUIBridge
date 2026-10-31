@@ -51,18 +51,33 @@ function setup(node) {
   if (node.size?.[0] < 260) node.size[0] = 280;
 }
 
+// The modal in melta UI's values (design/melta-ui: components/modal.md, foundations/elevation.md):
+// a black/50 backdrop, a rounded-xl frame with a slate-200 border and the overlay shadow, a 40px
+// icon button to close it (Charcoal "Close", aria-label, a primary focus ring). It lives in ComfyUI's
+// page, where Tailwind would reach ComfyUI's own UI, so these few rules stay scoped CSS (spe-*).
 function styles() {
   if (document.getElementById("spe-styles")) return;
   const s = document.createElement("style");
   s.id = "spe-styles";
   s.textContent = `
-.spe-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:99999;display:flex;align-items:center;justify-content:center}
-.spe-frame{position:relative;width:96vw;height:94vh;background:#1e1e1e;border:1px solid #444;border-radius:8px;overflow:hidden;box-shadow:0 10px 40px rgba(0,0,0,.7)}
+.spe-backdrop{position:fixed;inset:0;background:rgb(0 0 0 / .5);z-index:99999;display:flex;align-items:center;justify-content:center}
+.spe-frame{position:relative;width:96vw;height:94vh;background:#f9fafb;border:1px solid #e2e8f0;border-radius:.75rem;overflow:hidden;
+  box-shadow:0 20px 25px -5px rgb(0 0 0 / .1),0 8px 10px -6px rgb(0 0 0 / .1)}
 .spe-frame>iframe{width:100%;height:100%;border:0;display:block}
-.spe-close{position:absolute;top:6px;right:8px;z-index:2;width:28px;height:28px;border:0;border-radius:4px;background:rgba(0,0,0,.45);color:#ddd;font-size:18px;cursor:pointer}
-.spe-close:hover{background:rgba(255,80,80,.7);color:#fff}`;
+.spe-close{position:absolute;top:8px;right:8px;z-index:2;width:40px;height:40px;display:inline-flex;align-items:center;justify-content:center;
+  border:1px solid #e2e8f0;border-radius:.5rem;background:#fff;color:#64748b;cursor:pointer;transition:color .15s,background-color .15s}
+.spe-close:hover{color:#3d4b5f;background:#f9fafb}
+.spe-close:focus-visible{outline:none;box-shadow:0 0 0 2px rgb(43 112 239 / .5)}
+.spe-close svg{width:20px;height:20px}
+@media (prefers-color-scheme:dark){
+  .spe-frame{background:#161718;border-color:#373839}
+  .spe-close{background:#1b1c1d;border-color:#373839;color:#a3a3a3}
+  .spe-close:hover{color:#eee;background:#232525}
+}
+@media (prefers-reduced-motion:reduce){.spe-close{transition:none}}`;
   document.head.appendChild(s);
 }
+const CLOSE_ICON = '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M8.414 5.586a2 2 0 10-2.828 2.828L9.172 12l-3.586 3.586a2 2 0 102.828 2.828L12 14.828l3.586 3.586a2 2 0 102.828-2.828L14.828 12l3.586-3.586a2 2 0 10-2.828-2.828L12 9.172 8.414 5.586z" fill="currentColor"/></svg>';
 
 function closeEditor() {
   document.getElementById(MODAL)?.remove();
@@ -74,7 +89,8 @@ function openEditor(node) {
   const back = document.createElement("div");
   back.className = "spe-backdrop";
   back.id = MODAL;
-  back.innerHTML = `<div class="spe-frame"><button class="spe-close" title="Close (Esc)">×</button>
+  back.setAttribute("role", "dialog"); back.setAttribute("aria-modal", "true"); back.setAttribute("aria-label", "ODM Poser");
+  back.innerHTML = `<div class="spe-frame"><button type="button" class="spe-close" aria-label="Close (Esc)" title="Close (Esc)">${CLOSE_ICON}</button>
     <iframe src="${EDITOR}?node_id=${encodeURIComponent(node.id)}&_t=${Date.now()}"></iframe></div>`;
   back.querySelector(".spe-close").addEventListener("click", closeEditor);
   back.addEventListener("keydown", (e) => { if (e.key === "Escape") closeEditor(); });
