@@ -1,0 +1,2 @@
+# the editor's release, kept byte for byte as tools/update_editor.py writes it
+editor_html/** -text

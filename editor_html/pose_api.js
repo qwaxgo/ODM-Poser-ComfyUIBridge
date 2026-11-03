@@ -1,0 +1,567 @@
+// The MOD API (index.html, loaded last, after i18n.js). A mod is a script that calls
+//   ODMPoser.registerMod({id, name, version, api: 1, init(api){ ... }})
+// and adds things through the api object it gets: props and their categories, solid kinds,
+// aura kinds and parts, hand shapes, built-in poses, user presets, translations, panels, and
+// hooks into drawing, editing and the mouse. See docs/MODDING.md.
+//
+// Mods are loaded from mods/*.js and mods/<folder>/*.js (a repository of mods cloned into mods/).
+// The list is window.ODM_POSER_MODS from ../mods.js: in npm run dev and tools/serve.py that is web/mods.js
+// (written by tools/make_mods_list.py); a page that hosts the editor may serve it instead.
+// The MOD panel can also run a file for this session only, or a mods folder the person picks (opened
+// from disk the editor cannot list one itself). ?nomods in the address starts without mods.
+// A mod's own data lives in S.mods[id]: saved with the pose, undone with Ctrl+Z.
+(() => {
+const API_VERSION = "1.2.0", API_MAJOR = 1;
+const mods = [];                              // {id, name, version, file, status: "ok" | "error", error}
+const ORIGIN = {props: {}, solids: {}, auras: {}, parts: {}, hands: {}};   // kind key -> the mod id that added it
+const hooks = {drawBehind: [], draw: [], drawSide: [], afterEdit: [], sync: [], mode: []};
+let currentFile = "";
+
+// ---- reporting: a mod's error is shown in the MOD panel and the console, the editor goes on ------
+function fail(mod, where, err){
+  const msg = `${where}: ${err && err.message ? err.message : err}`;
+  console.error(`[ODM Poser MOD ${mod ? mod.id : "?"}] ${msg}`, err);
+  if (mod){ mod.status = "error"; mod.error = mod.error ? mod.error : msg; }
+  renderModList();
+}
+function guarded(mod, where, fn){
+  return (...a) => { try { return fn(...a); } catch (e) { fail(mod, where, e); return undefined; } };
+}
+
+// ---- hooks into the editor ------------------------------------------------------------------------
+{ const atari0 = drawAtari;
+  drawAtari = function(ctx, W, H, opts = {}){
+    for (const h of hooks.drawBehind) { ctx.save(); h(ctx, W, H, opts); ctx.restore(); }
+    atari0(ctx, W, H, opts);
+    for (const h of hooks.draw) { ctx.save(); h(ctx, W, H, opts); ctx.restore(); }
+  };
+}
+{ const scene0 = drawScene;
+  drawScene = function(ctx, W, H, opts, ...rest){
+    scene0(ctx, W, H, opts, ...rest);
+    if (opts && opts.side) for (const h of hooks.drawSide) { ctx.save(); h(ctx, W, H, opts); ctx.restore(); }
+  };
+}
+{ const edit0 = afterEdit;
+  afterEdit = function(moved){ edit0(moved); for (const h of hooks.afterEdit) h(moved === undefined ? -1 : moved); };
+}
+{ const sync0 = syncUI;
+  syncUI = function(){ sync0(); for (const h of hooks.sync) h(); };
+}
+document.querySelectorAll("#modes button").forEach(b => b.addEventListener("click", () => { for (const h of hooks.mode) h(mode); }));
+
+// ---- refreshing the panels after mods added things ----------------------------------------------
+function refreshPanels(){
+  const keep = (id, html) => { const el = $(id); if (!el) return; const v = el.value; el.innerHTML = html;
+    if ([...el.options].some(o => o.value === v)) el.value = v; };
+  keep("preset", Object.keys(PRESETS).map(n => `<option>${n}</option>`).join(""));
+  keep("handSel", Object.keys(HANDS).map(k => `<option value="${k}">${HAND_JA[k] || k}（${k}）</option>`).join(""));
+  keep("scCat", PROP_CATS.map(([k, ja, en]) => `<option value="${k}">${ja} / ${en}</option>`).join(""));
+  if ($("scCat")) $("scCat").dispatchEvent(new Event("change"));
+  keep("soKind", Object.entries(SOLID_KINDS).map(([k, d]) => `<option value="${k}">${d.ja}</option>`).join(""));
+  keep("auKind", Object.entries(AURA_KINDS).map(([k, [ja]]) => `<option value="${k}">${ja}</option>`).join(""));
+  keep("auPart", Object.entries(AURA_PARTS).map(([k, [ja]]) => `<option value="${k}">${ja}</option>`).join(""));
+  syncUI(); draw();
+}
+
+// ---- checking what a mod adds ---------------------------------------------------------------------
+const SHAPE_LEN = {c: 7, b: 6, s: 4, d: 7, k: 7, t: 8, h: 7};
+const PLACES = new Set(["hand", "body", "world", "grab", "wear"]);
+const WEAR_AT = new Set(["head", "chest", "back", "waist", "feet", "hands", "r_foot", "l_foot", "r_hand", "l_hand"]);
+const isNum = v => typeof v === "number" && isFinite(v);
+const isPoint = p => Array.isArray(p) && p.length === 3 && p.every(isNum);
+function checkShapes(parts, where){
+  if (!Array.isArray(parts)) throw new Error(`${where}: parts must be a list of shapes`);
+  parts.forEach((sh, i) => {
+    const keys = Object.keys(sh || {});
+    if (keys.length !== 1) throw new Error(`${where}[${i}]: one shape per entry ({c: [...]} etc.)`);
+    const k = keys[0], v = sh[k];
+    if (k === "l"){ if (!Array.isArray(v) || v.length < 2 || !v.every(isPoint)) throw new Error(`${where}[${i}]: l needs two or more [x, y, z] points`); return; }
+    if (!SHAPE_LEN[k]) throw new Error(`${where}[${i}]: unknown shape "${k}" (c b s d k t h l)`);
+    if (!Array.isArray(v) || v.length !== SHAPE_LEN[k] || !v.every(isNum)) throw new Error(`${where}[${i}]: ${k} needs ${SHAPE_LEN[k]} numbers`);
+  });
+}
+function checkProp(key, def){
+  if (!/^[\w:.-]+$/.test(key)) throw new Error(`prop key "${key}": letters, digits, _ : . - only`);
+  for (const f of ["ja", "en", "cat", "place"]) if (typeof def[f] !== "string" || !def[f]) throw new Error(`prop ${key}: "${f}" is required`);
+  if (!PROP_CATS.some(c => c[0] === def.cat)) throw new Error(`prop ${key}: no category "${def.cat}" (add it first)`);
+  if (!PLACES.has(def.place)) throw new Error(`prop ${key}: place must be one of ${[...PLACES].join(", ")}`);
+  if (def.place === "wear" && !def.sets && !WEAR_AT.has(def.at)) throw new Error(`prop ${key}: a worn thing needs at (${[...WEAR_AT].join(", ")}) or sets`);
+  if (def.pose && !HANDS[def.pose]) throw new Error(`prop ${key}: no hand shape "${def.pose}"`);
+  if (def.pose2 && !HANDS[def.pose2]) throw new Error(`prop ${key}: no hand shape "${def.pose2}"`);
+  for (const f of ["grip2", "bayonet"]) if (def[f] !== undefined && !isPoint(def[f])) throw new Error(`prop ${key}: ${f} must be [x, y, z]`);
+  if (def.make){
+    if (typeof def.make !== "function" || !Array.isArray(def.dims)) throw new Error(`prop ${key}: make needs dims [[label, cm], ...]`);
+    checkShapes(def.make(def.dims.map(d => d[1])), `prop ${key} make()`);
+  } else if (def.sets){
+    def.sets.forEach(([at, parts], i) => { if (!WEAR_AT.has(at)) throw new Error(`prop ${key}: sets[${i}] at "${at}"`); checkShapes(parts, `prop ${key} sets[${i}]`); });
+  } else checkShapes(def.parts, `prop ${key} parts`);
+  if (def.mount) for (const [j, p] of Object.entries(def.mount)){
+    if (IX[j] === undefined || !isPoint(p)) throw new Error(`prop ${key}: mount.${j} must be a joint name and [x, y, z]`); }
+  if (def.grab && !(Array.isArray(def.grab) && def.grab.every(s => Array.isArray(s) && s.length === 2 && s.every(isPoint))))
+    throw new Error(`prop ${key}: grab is a list of [[x, y, z], [x, y, z]] lines`);
+}
+
+// ---- shape helpers (the same as in pose_props.js) -------------------------------------------------
+const SHAPES = {
+  C: (...a) => ({c: a}), B: (...a) => ({b: a}), SP: (...a) => ({s: a}), D: (...a) => ({d: a}),
+  K: (...a) => ({k: a}), T: (...a) => ({t: a}), H: (...a) => ({h: a}), L: pts => ({l: pts}),
+  handle: (lo, hi, r = 1.6) => ({c: [0, lo, 0, 0, hi, 0, r]}),
+  pair: f => [...f(1), ...f(-1)],
+  ellipse: (cx, cy, cz, rx, ry, n = 24) => ({l: [...Array(n + 1)].map((_, i) => { const t = 2 * Math.PI * i / n;
+    return [cx + rx * Math.cos(t), cy + ry * Math.sin(t), cz]; })}),
+};
+
+// ---- the api a mod gets -----------------------------------------------------------------------------
+function makeApi(mod){
+  const i18n = () => window.ODMPoserI18n;
+  const tr = (ja, en) => { if (en) i18n() && i18n().add({[ja]: en}); };
+  const api = {
+    version: API_VERSION,
+    mod: {id: mod.id, name: mod.name},
+    // state: S is replaced on undo and load, so ask for it each time
+    state: () => S,
+    data: () => { S.mods = S.mods || {}; return S.mods[mod.id] = S.mods[mod.id] || {}; },
+    edit(fn, message){ remember(); fn(S); afterEdit(); syncUI(); draw(); if (message) say(message); },
+    redraw: () => draw(),
+    say: (message, warn) => say(message, warn),
+    mode: () => mode,
+    selectedJoint: () => (sel >= 0 ? J[sel] : null),
+    joints: {names: J.slice(), index: Object.assign({}, IX), parent: PARENT.slice(), ja: Object.assign({}, J_JA)},
+    math: {add, sub, mul, dot, cross, len, norm, rotAxis, deg},
+    view: {
+      front: () => front, side: () => side,
+      project: (p, W, H) => project(p, W, H),             // world cm -> front view pixels {x, y, s, z}
+      sideProject: (p, W, H) => sideProject(p, W, H),
+      ray: (x, y, W, H) => pixelRay(x, y, W, H),           // a pixel -> {o, dir} in the world
+      camera: () => Object.assign({}, S.cam),
+    },
+    shapes: SHAPES,
+    props: {
+      addCategory(key, ja, en){
+        if (!/^[\w:.-]+$/.test(key)) throw new Error(`category key "${key}"`);
+        if (!PROP_CATS.some(c => c[0] === key)) PROP_CATS.push([key, ja, en || ja]);
+      },
+      add(key, def){
+        if (PROPS[key] && !def.replace) throw new Error(`prop "${key}" exists (use a key like "${mod.id}:${key}", or replace: true)`);
+        checkProp(key, def);
+        PROPS[key] = Object.assign({}, def, {mod: mod.id}); delete PROPS[key].replace; ORIGIN.props[key] = mod.id;
+        tr(def.note, def.noteEn);
+      },
+      get: key => PROPS[key],
+      keys: () => Object.keys(PROPS),
+      categories: () => PROP_CATS.map(c => c.slice()),
+    },
+    items: {
+      add: (key, hand) => { addItem(key, hand); },          // what the 置く / 持つ buttons do
+      list: () => S.items || [],
+    },
+    solids: {
+      addKind(key, def){
+        if (SOLID_KINDS[key] && !def.replace) throw new Error(`solid kind "${key}" exists`);
+        if (!["box", "prism", "cyl", "pyr", "cone"].includes(def.shape)) throw new Error(`solid ${key}: shape is box, prism, cyl, pyr or cone`);
+        if (!(Array.isArray(def.size) && def.size.length === 3 && def.size.every(v => v > 0))) throw new Error(`solid ${key}: size [w, h, d] cm`);
+        SOLID_KINDS[key] = {ja: def.ja || key, en: def.en || def.ja || key, shape: def.shape, size: def.size.slice(),
+          sides: def.sides, at: isPoint(def.at) ? def.at.slice() : [90, 0, 0]};
+        ORIGIN.solids[key] = mod.id;
+        tr(def.ja, def.en);
+      },
+      add: kind => addSolid(kind),
+      list: () => S.solids || [],
+    },
+    auras: {
+      // draw(ctx, {points, hull, size, color, lineWidth, random, W, H}): points walk the outline
+      // ({x, y, nx, ny}: position and outward normal, pixels); front: drawn over the figure
+      addKind(key, def){
+        if (AURA_KINDS[key] && !def.replace) throw new Error(`aura kind "${key}" exists`);
+        if (typeof def.draw !== "function") throw new Error(`aura ${key}: draw(ctx, info) is required`);
+        AURA_KINDS[key] = [def.ja || key, def.color || "#ffffff", {front: !!def.front, draw: guarded(mod, `aura ${key}`, def.draw),
+          margin: isNum(def.margin) ? def.margin : 0.6}];
+        ORIGIN.auras[key] = mod.id;
+        tr(def.ja, def.en);
+      },
+      // chains: lists of joint names (and "r_hand" / "l_hand", the middle of the fist); one outline each
+      addPart(key, def){
+        if (!Array.isArray(def.chains) || !def.chains.every(c => Array.isArray(c) && c.every(n => IX[n] !== undefined || n === "r_hand" || n === "l_hand")))
+          throw new Error(`aura part ${key}: chains of joint names`);
+        AURA_PARTS[key] = [def.ja || key, def.chains];
+        ORIGIN.parts[key] = mod.id;
+        tr(def.ja, def.en);
+      },
+    },
+    hands: {
+      // curl per finger (thumb, index, middle, ring, pinky): 0 straight .. 1 closed
+      add(key, def){
+        if (!/^[a-z_][a-z0-9_]*$/.test(key)) throw new Error(`hand shape key "${key}": lower case, digits and _`);
+        if (!(Array.isArray(def.curl) && def.curl.length === 5 && def.curl.every(isNum))) throw new Error(`hand ${key}: curl is five numbers`);
+        HANDS[key] = def.curl.slice(); HAND_JA[key] = def.ja || key; ORIGIN.hands[key] = mod.id;
+        tr(`${def.ja || key}（${key}）`, def.en);
+      },
+      set(side, key){ if (!HANDS[key]) throw new Error(`no hand shape "${key}"`); S.hands[side === "l" ? "l" : "r"] = key; },
+      shapes: () => Object.keys(HANDS),
+    },
+    poses: {
+      // turns: [[joint, "x" | "y" | "z", degrees], ...] from the standing pose (as PRESETS in pose_main.js)
+      add(name, def){
+        if (!Array.isArray(def.turns) || !def.turns.every(t => IX[t[0]] !== undefined && "xyz".includes(t[1]) && isNum(t[2])))
+          throw new Error(`pose ${name}: turns [[joint, axis, degrees], ...]`);
+        PRESETS[name] = def.turns.map(t => t.slice());
+        tr(name, def.en);
+      },
+      apply: name => { remember(); applyPreset(name); S.pins = {}; afterEdit(); syncUI(); draw(); },
+    },
+    presets: {
+      // user presets {group, name, P (21 joints, cm; 19 without the hands also do)}, added to the list of user presets
+      add(list){ if (!Array.isArray(list)) throw new Error("presets.add takes a list");
+        setUserPresets(TC.concat(list.filter(p => p && Array.isArray(p.P) && (p.P.length === J.length || p.P.length === 19))
+          .map(p => ({group: String(p.group || mod.name), name: String(p.name || ""), P: p.P})))); },
+    },
+    // files: the exported pictures and the pose, as the 書き出し buttons make them
+    io: {
+      render: kind => render(kind === "openpose" ? "openpose" : "atari"),   // a PNG data URL at the export size
+      exportSize: () => exportSize(),
+      setExportSize(W, H){ if (+W > 0) $("W").value = Math.round(+W); if (+H > 0) $("H").value = Math.round(+H); draw(); },
+      poseJSON: () => JSON.stringify({version: 3, ...S}),
+      sceneJSON: () => JSON.stringify(sceneOnly()),
+      loadPose(p){                           // a pose (object or JSON text) as saved; false when it is not one
+        if (typeof p === "string") p = JSON.parse(p);
+        if (!p || !Array.isArray(p.P)) return false;
+        migrate(p);
+        if (p.P.length !== J.length) return false;
+        S = Object.assign(fresh(), p); syncUI(); draw(); return true;
+      },
+    },
+    i18n: {
+      add: table => i18n() && i18n().add(table),              // {"日本語": "English", ...}
+      addRule: (re, fn) => i18n() && i18n().addRule(re, guarded(mod, "i18n rule", fn)),
+      lang: () => (i18n() ? i18n().lang : "ja"),
+    },
+    ui: {
+      // a tab of the side panel's menu, in a big group and a category: an existing one by its id
+      // (groups: make 作る / look 見る / out 出す; categories: figure, things, scenes, viewpoint, file)
+      // or a new one {id, title, icon}. icon: an icon's name (ui-icons.js) or an <svg>. The tab's id
+      // is the mod's ("<mod id>:<id>"); addSection({menu: id}) puts a section under it.
+      addMenu({id, title, titleEn, icon, tip, top = "out", mid = "file"}){
+        const ui = window.ODMUI; if (!ui || !ui.addMenu || !id) return null;
+        const full = mod.id + ":" + id;
+        tr(title, titleEn);
+        for (const s of [top, mid]) if (s && typeof s === "object") tr(s.title, s.titleEn);
+        return ui.addMenu({id: full, title: title || id, icon, tip, top, mid}) ? full : null;
+      },
+      // a section in the side panel (at: "top" puts it first); html is yours (ids: prefix them with the
+      // mod id). menu: one of the editor's tabs (pose, equip, camera, ...) or a tab of this mod's
+      // (addMenu); without it the section goes under the MOD tab, and at: "top" without it is shown
+      // in every tab (as before the tabs: a host's own buttons, say)
+      addSection({title, html = "", titleEn, at, menu}){
+        const sec = document.createElement("section");
+        sec.dataset.mod = mod.id;
+        if (menu){ const own = mod.id + ":" + menu; sec.dataset.menu = window.ODMUI && window.ODMUI.hasMenu && window.ODMUI.hasMenu(own) ? own : menu; }
+        else if (at === "top") sec.dataset.menu = "*";
+        sec.innerHTML = `<h2></h2>${html}`;
+        sec.querySelector("h2").textContent = title || mod.name;
+        tr(title, titleEn);
+        if (at === "top") document.querySelector("aside").prepend(sec); else $("modBox").closest("section").before(sec);
+        return sec;
+      },
+      $: id => document.getElementById(id),
+    },
+    // events: drawBehind / draw (ctx, W, H, opts: export, side ...), drawSide, afterEdit (moved joint
+    // index or -1), sync (after undo / load), mode (the new mode), pointerDown (canvas, x, y, event:
+    // return {move(x, y, event)} to take the drag), wheel (x, y, step, event: return true when used)
+    on(event, fn){
+      if (typeof fn !== "function") throw new Error("on(event, fn)");
+      if (event === "pointerDown"){ const g = guarded(mod, "pointerDown", fn);
+        DOWN_HOOKS.splice(Math.max(0, DOWN_HOOKS.length - 1), 0, (cv, x, y, e) => { const d = g(cv, x, y, e);
+          return d && typeof d.move === "function" ? {move: guarded(mod, "drag", d.move)} : null; }); return; }
+      if (event === "wheel"){ const g = guarded(mod, "wheel", fn); WHEEL_HOOKS.push((x, y, step, e) => !!g(x, y, step, e)); return; }
+      if (!hooks[event]) throw new Error(`no event "${event}" (${[...Object.keys(hooks), "pointerDown", "wheel"].join(", ")})`);
+      hooks[event].push(guarded(mod, event, fn));
+    },
+  };
+  return api;
+}
+
+// ---- registering ---------------------------------------------------------------------------------
+window.ODMPoser = {
+  version: API_VERSION,
+  registerMod(def){
+    const mod = {id: def && def.id, name: (def && def.name) || (def && def.id) || currentFile, version: (def && def.version) || "",
+      file: currentFile, status: "ok", error: ""};
+    try {
+      if (!def || typeof def.id !== "string" || !/^[a-z0-9][a-z0-9_-]*$/.test(def.id)) throw new Error("id: lower case letters, digits, _ and -");
+      if (mods.some(m => m.id === def.id && m.status === "ok")) throw new Error(`a mod "${def.id}" is already loaded`);
+      const need = +String(def.api || 1).split(".")[0];
+      if (need > API_MAJOR) throw new Error(`needs API ${def.api}, this editor has ${API_VERSION}`);
+      if (typeof def.init !== "function") throw new Error("init(api) is required");
+      mods.push(mod);
+      def.init(makeApi(mod));
+    } catch (e) {
+      if (!mods.includes(mod)) mods.push(mod);
+      fail(mod, "init", e);
+    }
+    renderModList();
+    if (!loading) refreshPanels();
+  },
+  mods: () => mods.map(m => Object.assign({}, m)),
+  // what the editor has before any mod (props, solid kinds, auras, aura parts, hand shapes): a link
+  // that opens a pose (pose_share.js) carries no mod, so what a mod added is swapped for these
+  builtin: Object.freeze({props: new Set(Object.keys(PROPS)), solids: new Set(Object.keys(SOLID_KINDS)),
+    auras: new Set(Object.keys(AURA_KINDS)), parts: new Set(Object.keys(AURA_PARTS)), hands: new Set(Object.keys(HANDS))}),
+  // the official mods (qwaxgo's, on GitHub) may travel with a link: their kinds stay and whoever
+  // opens it may add them from GitHub. A clone of a qwaxgo repository in mods/ counts as its GitHub
+  // copy (the one who opens the link gets the GitHub file, never the sender's).
+  origin: (kind, key) => (ORIGIN[kind] || {})[key] || "",
+  officialMods(){
+    return mods.filter(m => m.status === "ok").map(m => ({id: m.id, url: officialUrl(m.file)})).filter(m => m.url);
+  },
+  isOfficial: url => !!officialUrl(url),
+  // add an official mod by its GitHub address (the person's click on the link's offer is the consent)
+  async addOfficialMod(url){
+    url = officialUrl(url); if (!url) return false;
+    let recs = []; try { recs = await STORE.all(); } catch (e) {}
+    if (recs.some(r => r.kind === "url" && officialUrl(r.url) === url)) return true;
+    const rec = {kind: "url", url, name: decodeURIComponent(url.split("/").pop() || url), enabled: true, added: Date.now()};
+    try { rec.key = await STORE.put(rec); } catch (err) { return false; }
+    await runStored(rec); renderStored(); refreshPanels();
+    return true;
+  },
+  modsReady: null,                            // a promise: the mods are loaded
+};
+// a qwaxgo GitHub address of a mod file (raw), or ""
+function officialUrl(file){
+  file = String(file || "");
+  let m = file.match(/^https:\/\/github\.com\/qwaxgo\/([\w.-]+)\/blob\/([\w.-]+)\/([\w./-]+\.js)$/);
+  if (m) return `https://raw.githubusercontent.com/qwaxgo/${m[1]}/${m[2]}/${m[3]}`;
+  m = file.match(/^https:\/\/raw\.githubusercontent\.com\/qwaxgo\/[\w.-]+\/[\w.-]+\/[\w./-]+\.js$/);
+  if (m && !file.includes("..")) return file;
+  m = file.match(/^(ODM-Poser-[\w.-]+)\/([\w./-]+\.js)$/);           // a clone in mods/
+  if (m && !file.includes("..")) return `https://raw.githubusercontent.com/qwaxgo/${m[1]}/main/${m[2]}`;
+  return "";
+}
+window.SymbolicPose = window.ODMPoser;        // the old name: mods written for it still load
+
+// ---- mods kept in this browser: installed from a file, or added by URL ---------------------------------
+// They work where the editor has no mods/ folder (a site such as GitHub Pages, the installed app,
+// a phone). A file mod keeps its text; a URL mod is read again at each start (GitHub "blob" pages
+// become their raw file) and its last text is kept for offline use. Records:
+// {key, kind: "file" | "url", name, url, source, enabled, added, fetched}
+const STORE = (() => {
+  let dbp = null;
+  const open = () => dbp || (dbp = new Promise((ok, no) => {
+    const r = indexedDB.open("odm-poser-mods", 1);
+    r.onupgradeneeded = () => r.result.createObjectStore("mods", {keyPath: "key", autoIncrement: true});
+    r.onsuccess = () => ok(r.result); r.onerror = () => no(r.error);
+  }));
+  const tx = (mode, fn) => open().then(db => new Promise((ok, no) => {
+    const t = db.transaction("mods", mode), req = fn(t.objectStore("mods"));
+    t.oncomplete = () => ok(req.result); t.onerror = () => no(t.error);
+  }));
+  return {all: () => tx("readonly", st => st.getAll()), put: rec => tx("readwrite", st => st.put(rec)),
+          del: key => tx("readwrite", st => st.delete(key))};
+})();
+function rawUrl(u){
+  const m = u.match(/^https:\/\/github\.com\/([^/]+)\/([^/]+)\/blob\/(.+)$/);
+  return m ? `https://raw.githubusercontent.com/${m[1]}/${m[2]}/${m[3]}` : u;
+}
+async function runSource(text, label){
+  const url = URL.createObjectURL(new Blob([text], {type: "text/javascript"}));
+  await runScript(url, label);
+  URL.revokeObjectURL(url);
+}
+async function runStored(rec){
+  if (rec.kind === "folder"){                 // read again once the person allows it (the button in the list)
+    try { if (await rec.handle.queryPermission({mode: "read"}) === "granted") await runFolder(await folderFiles(rec.handle)); }
+    catch (e) { folderFailed(rec.name, e); }
+    return;
+  }
+  if (rec.kind === "url"){
+    let text = null;
+    try { const r = await fetch(rawUrl(rec.url), {cache: "no-cache"});
+      if (r.ok){ text = await r.text(); if (text !== rec.source){ rec.source = text; } rec.fetched = Date.now(); STORE.put(rec).catch(() => {}); } }
+    catch (e) {}
+    text = text || rec.source;
+    if (!text){ const m = {id: rec.url, name: rec.name, file: rec.url, status: "error", error: ""}; mods.push(m);
+      fail(m, "load", new Error("the address could not be read (and no copy is kept yet)")); return; }
+    return runSource(text, rec.url);
+  }
+  return runSource(rec.source || "", "device/" + rec.name);
+}
+async function loadStored(){
+  let recs = [];
+  try { recs = await STORE.all(); } catch (e) { return; }
+  for (const rec of recs.sort((a, b) => a.key - b.key)) if (rec.enabled !== false) await runStored(rec);
+}
+
+// ---- a mods folder picked in the editor ------------------------------------------------------------
+// Its *.js and <folder>/*.js load as tools/make_mods_list.py would list them (a file already loaded is skipped), named
+// by their path in the folder, so a clone of an official repository stays official. Chrome and Edge
+// keep the folder in this browser ({kind: "folder", name, handle}); other browsers pick it each time.
+const MOD_PATH = /^([A-Za-z0-9-][\w.-]*\/)?[A-Za-z0-9-][\w.-]*\.js$/;   // names starting with _ or . stay out, as in mods/
+async function folderFiles(dir, path = ""){   // a folder -> [[path, File]]
+  const out = [];
+  for await (const [name, h] of dir.entries()){
+    if (h.kind === "file" && MOD_PATH.test(path + name)) out.push([path + name, await h.getFile()]);
+    else if (h.kind === "directory" && !path && MOD_PATH.test(name + "/x.js")) out.push(...await folderFiles(h, name + "/"));
+  }
+  return out;
+}
+async function runFolder(files){
+  const have = new Set(mods.filter(m => m.status === "ok").map(m => m.file));
+  for (const [path, f] of files.sort((a, b) => a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+    if (!have.has(path)) await runSource(await f.text(), path);
+}
+function folderFailed(name, err){
+  const m = {id: "folder/" + name, name: "folder/" + name, file: "", status: "error", error: ""}; mods.push(m);
+  fail(m, "load", new Error(`the folder could not be read (${err && err.name || err})`));
+}
+
+// ---- the MOD panel ---------------------------------------------------------------------------------
+{ const sec = document.createElement("section");
+  const field = "flex:1;min-width:0";
+  sec.innerHTML = `<h2>MOD</h2>
+    <div id="modBox" class="hint">読み込んだ MOD はありません。</div>
+    <label style="margin-top:10px">この端末に入れた MOD</label>
+    <div id="modStored" class="hint">まだありません。</div>
+    <div class="btns" style="margin-top:6px"><button id="modInstall" title="ファイルから入れる（この端末）">ファイルから</button>
+      <input type="file" id="modInstallFile" accept=".js,text/javascript" multiple hidden>
+      <button id="modFolder" title="mods フォルダを選んで、中の MOD を読み込む">フォルダから</button>
+      <input type="file" id="modFolderFile" webkitdirectory hidden>
+      <button id="modLoad">今回だけ読み込む</button>
+      <input type="file" id="modFile" accept=".js,text/javascript" multiple hidden></div>
+    <div class="row" style="margin-top:6px"><input type="text" id="modUrl" inputmode="url" placeholder="https://…/mod.js（GitHub のファイルのページでも可）" style="${field}">
+      <button id="modUrlAdd">URLから追加</button></div>
+    <div class="hint">mods フォルダ（とその中のフォルダ）の *.js を起動時に読み込みます（ディスクから開いたときは mods.js に書いたものだけです。「フォルダから」で mods フォルダを選ぶと中の MOD をまとめて読み込めて、Chrome と Edge ではそのフォルダを覚えます）。「ファイルから入れる」と「URLから追加」の MOD はこのブラウザに保存され、毎回読み込まれます（mods フォルダのないサイトやスマホでも使えます。URL の MOD は毎回新しい版を読み、オフラインでは前回のものを使います）。MOD はエディタの中で自由に動くプログラムなので、信頼できるものだけを入れてください。アドレスの末尾に ?nomods を付けると MOD なしで開きます。</div>`;
+  document.querySelector("aside").appendChild(sec);
+  $("modLoad").addEventListener("click", () => $("modFile").click());
+  $("modFile").addEventListener("change", async e => {
+    const files = [...e.target.files]; e.target.value = "";
+    for (const f of files) await runSource(await f.text(), f.name);
+    refreshPanels();
+  });
+  // a mods folder: kept where the browser can (asked again for reading at a later start), run now
+  $("modFolder").addEventListener("click", async () => {
+    if (typeof window.showDirectoryPicker !== "function"){ $("modFolderFile").click(); return; }
+    let dir; try { dir = await window.showDirectoryPicker({id: "odm-poser-mods", mode: "read"}); } catch (e) { return; }   // cancelled
+    let recs = null; try { recs = await STORE.all(); } catch (e) {}
+    let kept = false;
+    if (recs){
+      let same = false;
+      for (const r of recs) if (r.kind === "folder" && await r.handle.isSameEntry(dir).catch(() => false)) same = true;
+      if (!same) try { await STORE.put({kind: "folder", name: dir.name, handle: dir, enabled: true, added: Date.now()}); kept = true; } catch (e) {}
+    }
+    try { await runFolder(await folderFiles(dir)); } catch (e) { folderFailed(dir.name, e); }
+    renderStored(); refreshPanels();
+    say(kept ? "フォルダの MOD を読み込みました。次からはこのフォルダも読み込みます（読み取りの許可を聞かれたら「読み込む」を押します）。"
+      : "フォルダの MOD を読み込みました。");
+  });
+  $("modFolderFile").addEventListener("change", async e => {
+    const files = [...e.target.files].map(f => [f.webkitRelativePath.split("/").slice(1).join("/"), f]).filter(([p]) => MOD_PATH.test(p));
+    e.target.value = "";
+    await runFolder(files); refreshPanels();
+    say("フォルダの MOD を読み込みました（このブラウザでは今回だけです）。");
+  });
+  // install: kept in this browser (a file of the same name is replaced), and run now
+  $("modInstall").addEventListener("click", () => $("modInstallFile").click());
+  $("modInstallFile").addEventListener("change", async e => {
+    const files = [...e.target.files]; e.target.value = "";
+    let recs = [];
+    try { recs = await STORE.all(); } catch (err) { say("このブラウザには MOD を保存できません（今回だけ読み込みます）。", true); }
+    for (const f of files){
+      const text = await f.text(), old = recs.find(r => r.kind === "file" && r.name === f.name);
+      try { await STORE.put(Object.assign(old || {kind: "file", added: Date.now()}, {name: f.name, source: text, enabled: true})); } catch (err) {}
+      if (!old) await runSource(text, "device/" + f.name);
+    }
+    renderStored(); refreshPanels();
+    say(files.some(f => recs.some(r => r.kind === "file" && r.name === f.name))
+      ? "MOD を入れ替えました。開き直すと新しい版になります。" : "MOD をこの端末に入れました。次からは自動で読み込みます。");
+  });
+  // by address: confirmed once, kept, read at once
+  $("modUrlAdd").addEventListener("click", async () => {
+    const url = $("modUrl").value.trim();
+    if (!/^https:\/\/\S+$/.test(url) && !/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?\//.test(url)){ say("https:// で始まる MOD のアドレスを入れてください。", true); return; }
+    if (!confirm("このアドレスの MOD を、エディタを開くたびに読み込んで実行します。信頼できるものだけを追加してください。\n\n" + url)) return;
+    const rec = {kind: "url", url, name: decodeURIComponent(url.split("/").pop() || url), enabled: true, added: Date.now()};
+    try { rec.key = await STORE.put(rec); } catch (err) { say("このブラウザには MOD を保存できません。", true); return; }
+    $("modUrl").value = "";
+    await runStored(rec); renderStored(); refreshPanels();
+    say("MOD を追加しました。次からは自動で読み込みます。");
+  });
+}
+async function renderStored(){
+  const box = $("modStored"); if (!box) return;
+  let recs = [];
+  try { recs = await STORE.all(); } catch (e) { box.textContent = "このブラウザには保存できません。"; return; }
+  if (!recs.length){ box.textContent = "まだありません。"; return; }
+  recs.sort((a, b) => a.key - b.key);
+  // a kept folder the browser has not let the editor read yet gets a button (asked before the list is
+  // emptied, so that two calls at once do not both fill it)
+  const asks = await Promise.all(recs.map(r => r.kind === "folder" && r.enabled !== false
+    && r.handle.queryPermission({mode: "read"}).then(p => p !== "granted", () => true)));
+  box.innerHTML = "";
+  for (const [i, rec] of recs.entries()){
+    const row = document.createElement("div"); row.className = "row"; row.style.marginTop = "4px";
+    const on = document.createElement("input"); on.type = "checkbox"; on.checked = rec.enabled !== false; on.title = "有効";
+    const name = document.createElement("span"); name.style.cssText = "flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap";
+    name.textContent = (rec.kind === "url" ? "URL: " : rec.kind === "folder" ? "フォルダ: " : "") + rec.name; name.title = rec.url || rec.name;
+    const del = document.createElement("button"); del.type = "button"; del.textContent = "外す";
+    let ask = null;
+    if (asks[i]){
+      ask = document.createElement("button"); ask.type = "button"; ask.textContent = "読み込む"; ask.title = "このフォルダの MOD を読み込む（読み取りの許可を聞かれます）";
+      ask.addEventListener("click", async () => {
+        if (await rec.handle.requestPermission({mode: "read"}).catch(() => "denied") !== "granted") return;
+        try { await runFolder(await folderFiles(rec.handle)); } catch (e) { folderFailed(rec.name, e); }
+        renderStored(); refreshPanels();
+      });
+    }
+    on.addEventListener("change", async () => { rec.enabled = on.checked; await STORE.put(rec).catch(() => {});
+      say(on.checked ? "有効にしました。開き直すと読み込みます。" : "無効にしました。開き直すと読み込まれません。"); });
+    del.addEventListener("click", async () => { if (!confirm(`「${rec.name}」をこの端末から外しますか？`)) return;
+      await STORE.del(rec.key).catch(() => {}); renderStored(); say("外しました。開き直すと読み込まれません。"); });
+    row.append(on, name, ...(ask ? [ask] : []), del); box.appendChild(row);
+  }
+}
+function renderModList(){
+  const box = $("modBox"); if (!box) return;
+  if (!mods.length){ box.textContent = "読み込んだ MOD はありません。"; return; }
+  box.innerHTML = "";
+  for (const m of mods){
+    const row = document.createElement("div");
+    row.textContent = `${m.status === "ok" ? "✓" : "✗"} ${m.name}${m.version ? " " + m.version : ""}${m.file ? " (" + m.file + ")" : ""}`;
+    if (m.status !== "ok"){ row.style.color = "var(--warn)"; row.title = m.error; row.textContent += ": " + m.error; }
+    box.appendChild(row);
+  }
+}
+
+// ---- loading mods/*.js ----------------------------------------------------------------------------
+let loading = false;
+function runScript(src, file){
+  return new Promise(done => {
+    currentFile = file;
+    const s = document.createElement("script");
+    // a mistake in the file itself (a syntax error, an error before registerMod) is reported too
+    const caught = e => { if (e.filename && e.filename.split("?")[0].endsWith(src.split("/").pop())){
+      const m = {id: file, name: file, file, status: "error", error: ""}; mods.push(m); fail(m, "script", e.error || e.message); } };
+    window.addEventListener("error", caught);
+    const end = () => { window.removeEventListener("error", caught); currentFile = ""; done(); };
+    s.src = src;
+    s.onload = end;
+    s.onerror = () => { const m = {id: file, name: file, file, status: "error", error: ""};
+      mods.push(m); fail(m, "load", new Error("the file could not be read")); end(); };
+    document.body.appendChild(s);
+  });
+}
+async function loadMods(){
+  const list = Array.isArray(window.ODM_POSER_MODS) ? window.ODM_POSER_MODS
+    : Array.isArray(window.SYMBOLIC_POSE_MODS) ? window.SYMBOLIC_POSE_MODS : [];       // a list written before the rename
+  renderStored();
+  if (new URLSearchParams(location.search).has("nomods")) return;
+  const base = window.ODM_POSER_MODS_BASE || window.SYMBOLIC_POSE_MODS_BASE || "../mods/";
+  loading = true;
+  for (const name of list) if (/^([\w.-]+\/)?[\w.-]+\.js$/.test(name))
+    await runScript(base + name.split("/").map(encodeURIComponent).join("/"), name);
+  await loadStored();                         // then the ones kept in this browser
+  loading = false;
+  refreshPanels();
+}
+window.ODMPoser.modsReady = loadMods();
+})();

@@ -14,7 +14,8 @@ from pathlib import Path
 from .paths import USER_PRESETS, editor_dir, mod_files
 
 TYPES = {".html": "text/html", ".js": "application/javascript", ".webmanifest": "application/manifest+json",
-         ".svg": "image/svg+xml", ".png": "image/png", ".json": "application/json"}
+         ".svg": "image/svg+xml", ".png": "image/png", ".json": "application/json", ".css": "text/css",
+         ".md": "text/markdown"}
 
 
 def user_presets():

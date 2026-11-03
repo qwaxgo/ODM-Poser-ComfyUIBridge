@@ -2,8 +2,9 @@
 
 The UI follows **melta UI** (`design/melta-ui`, a git submodule; read `design/melta-ui/DESIGN.md`).
 
-- The editor itself (the `editor/` submodule, ODM-Poser) carries its own melta setup (its
-  `AGENTS.md`, `web/editor/ui.js`, `ui.css`): change the editor's look there, not here.
+- The editor itself (ODM-Poser) carries its own melta setup (its `AGENTS.md`, `web/editor/ui.js`,
+  `ui.css`): change the editor's look there, not here. `editor_html/` is a built release of it
+  (`python tools/update_editor.py <version>`); never edit those files by hand.
 - This repository's own UI is the node's modal (`web/js/odm_poser.js`): it lives in ComfyUI's page,
   where Tailwind would reach ComfyUI's own UI, so it keeps a few scoped rules (`spe-*`) written in
   melta's values (black/50 backdrop, rounded-xl frame with a slate-200 border and the overlay

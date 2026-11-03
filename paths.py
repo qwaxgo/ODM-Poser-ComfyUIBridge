@@ -1,11 +1,13 @@
 """Where things are: the editor (ODM Poser), the mods, the user's presets.
 
-The editor is the git submodule `editor/` unless config.json names another folder:
+The editor is the built release in `editor_html/` (tools/update_editor.py puts it there) unless
+config.json names another folder:
 
-    {"editor": "C:/AI/ODM-Poser", "mods": ["C:/AI/ODM-Poser/mods"]}
+    {"editor": "C:/AI/ODM-Poser/dist", "mods": ["C:/AI/ODM-Poser/mods"]}
 
-("editor": a checkout of ODM-Poser, for working on the editor itself; "mods": more mod folders,
-read after this bridge's own `mods/`.) config.json is optional and stays out of git.
+("editor": a built editor, for working on the editor itself: a checkout's dist/ after npm run build,
+an unzipped HTML release, or the folder holding index.html; "mods": more mod folders, read after
+this bridge's own `mods/`.) config.json is optional and stays out of git.
 """
 
 from __future__ import annotations
@@ -16,6 +18,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 CONFIG = HERE / "config.json"
+EDITOR_HTML = HERE / "editor_html"
 USER_PRESETS = HERE / "user_presets"
 BRIDGE_MOD = HERE / "mod" / "comfyui.js"
 BRIDGE_NAME = "_bridge/comfyui.js"            # how the editor's list calls it (loaded first)
@@ -30,14 +33,28 @@ def settings() -> dict:
         return {}
 
 
-def editor_root() -> Path:
-    p = settings().get("editor")
-    return Path(p).expanduser() if p else HERE / "editor"
-
-
 def editor_dir() -> Path:
-    """The editor's page and scripts (web/editor/ of the editor's folder)."""
-    return editor_root() / "web" / "editor"
+    """The editor's page and scripts: editor_html/, or the built editor config.json names (its
+    editor/ first, as dist/ and an unzipped release both have an index.html of their own beside it;
+    then a checkout's dist/editor/, then the folder itself)."""
+    p = settings().get("editor")
+    if not p:
+        return EDITOR_HTML
+    root = Path(p).expanduser()
+    for d in (root / "editor", root / "dist" / "editor", root):
+        if (d / "index.html").is_file():
+            return d
+    return root
+
+
+def editor_version() -> str:
+    """The version in editor_html/VERSION ("" for an editor named in config.json)."""
+    if settings().get("editor"):
+        return ""
+    try:
+        return (EDITOR_HTML / "VERSION").read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
 
 
 def mod_dirs() -> list[Path]:

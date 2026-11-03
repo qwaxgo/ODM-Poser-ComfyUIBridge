@@ -1,0 +1,2001 @@
+// The editor's own script (src/pages/editor/index.astro, loaded after pose_props_more.js): the figure,
+// its state S, the views, the edit pipeline and the panel. The modules after it (pose_scene.js, ...)
+// share its global names.
+"use strict";
+// ---- the figure: joints in world space (cm, y up, the figure faces +z) -------------------
+// The figure's own right is screen left when it faces the camera (x < 0).
+// r_hand / l_hand: the hand from the wrist to the knuckles, so the wrist bends. They come last, so
+// a pose saved with the first 19 joints keeps its numbers (upgradeState() adds the hands to it).
+const J = ["pelvis","waist","chest","neck","head","r_shoulder","r_elbow","r_wrist","l_shoulder",
+           "l_elbow","l_wrist","r_hip","r_knee","r_ankle","r_toe","l_hip","l_knee","l_ankle","l_toe",
+           "r_hand","l_hand"];
+const J_JA = {pelvis:"腰（全体）", waist:"ウエスト", chest:"胸", neck:"首", head:"頭", r_shoulder:"右肩",
+  r_elbow:"右肘", r_wrist:"右手首", l_shoulder:"左肩", l_elbow:"左肘", l_wrist:"左手首", r_hip:"右股",
+  r_knee:"右膝", r_ankle:"右足首", r_toe:"右つま先", l_hip:"左股", l_knee:"左膝", l_ankle:"左足首", l_toe:"左つま先",
+  r_hand:"右手", l_hand:"左手"};
+const IX = Object.fromEntries(J.map((n, i) => [n, i]));
+const PARENT = [-1, 0, 1, 2, 3, 2, 5, 6, 2, 8, 9, 0, 11, 12, 13, 0, 15, 16, 17, 7, 10];
+const MIRROR = J.map(n => IX[n.startsWith("r_") ? "l_" + n.slice(2) : n.startsWith("l_") ? "r_" + n.slice(2) : n]);
+const REST = [
+  [0, 95, 0], [0, 111, 0], [0, 130, 0], [0, 145, 0], [0, 158, 0],
+  [-18, 142, 0], [-21, 114, 0], [-23, 88, 0], [18, 142, 0], [21, 114, 0], [23, 88, 0],
+  [-10, 92, 0], [-11, 50, 0], [-12, 9, 0], [-12, 2, 13], [10, 92, 0], [11, 50, 0], [12, 9, 0], [12, 2, 13],
+  [-23.6, 80, 0], [23.6, 80, 0]];
+// the waist's "radius" is half the waist's width (the torso is drawn as two trapezoids:
+// shoulders -> waist and waist -> the thigh roots); pelvis, waist and chest show small handles
+const REST_R = [3, 12, 3, 4, 11, 4.5, 4, 5, 4.5, 4, 5, 6, 4.5, 4, 3, 6, 4.5, 4, 3, 3, 3];
+// small grey handles, for the editor only: pelvis, waist, chest, and the hands (the fingers show them)
+const HANDLE = new Set([0, 1, 2, 19, 20]);
+const HAND_J = new Set([19, 20]);
+const HAND_LEN = 8;                          // wrist -> knuckles, cm
+// a pose from before the hands (19 joints): each hand goes on along its forearm
+function upgradeState(st){
+  if (!st) return;
+  const one = f => {
+    if (!f || !Array.isArray(f.P)) return;
+    if (f.P.length < J.length){
+      for (const s of ["r", "l"]){ const w = f.P[IX[s + "_wrist"]], e = f.P[IX[s + "_elbow"]];
+        if (w && e) f.P.push(add(w, mul(norm(sub(w, e)), HAND_LEN))); }
+      if (Array.isArray(f.R)) while (f.R.length < J.length) f.R.push(REST_R[f.R.length]);
+      if (Array.isArray(f.twist)) while (f.twist.length < J.length) f.twist.push(0);
+    }
+    // a hand twist kept from before goes to the forearm (the palm stays where it is)
+    if (Array.isArray(f.twist)) for (const s of ["r", "l"]){ const h = IX[s + "_hand"], w = IX[s + "_wrist"];
+      if (f.twist[h]){ f.twist[w] = (f.twist[w] || 0) + f.twist[h]; f.twist[h] = 0; } }
+  };
+  one(st); (st.others || []).forEach(one);
+}
+const handleR = i => HANDLE.has(i) ? 3.2 : S.R[i];
+const KIDS = J.map((_, i) => J.map((__, k) => k).filter(k => PARENT[k] === i));
+function subtree(i){ const out = [i]; for (let k = 0; k < out.length; k++) out.push(...KIDS[out[k]]); return out; }
+
+// hand shapes (curl per finger: thumb, index, middle, ring, pinky; 0 straight, 1 closed)
+const HANDS = {
+  relaxed:[.25,.3,.35,.4,.45], open:[0,0,0,0,0], fist:[.75,1,1,1,1], peace:[.9,0,0,1,1],
+  point:[.7,0,1,1,1], thumbs_up:[0,1,1,1,1], ok:[.55,.6,0,0,0], gun:[.15,0,1,1,1],
+  rock:[.9,0,1,1,0], grip:[.6,.75,.8,.8,.8], claw:[.5,.7,.7,.7,.7],
+  pinch:[.55,.6,.9,.95,.95], cup:[.35,.45,.5,.55,.6], trigger:[.6,.25,1,1,1]};
+const HAND_JA = {relaxed:"自然", open:"パー", fist:"グー", peace:"ピース", point:"指差し",
+  thumbs_up:"サムズアップ", ok:"OK", gun:"指鉄砲", rock:"ロック", grip:"握り込む", claw:"かぎ爪",
+  pinch:"つまむ（ペン）", cup:"包む（カップ・ボール）", trigger:"引き金"};
+
+// ---- state -------------------------------------------------------------------------------
+let S = fresh();
+function fresh(){
+  return {P: REST.map(p => p.slice()), R: REST_R.slice(), hands: {r: "relaxed", l: "relaxed"},
+          head: {yaw: 0, pitch: 0}, cam: {lens: 50, yaw: 0, pitch: 0, roll: 0, zoom: 1},
+          body: {yaw: 0, pitch: 0, roll: 0}, twist: REST.map(() => 0),
+          pins: {}, items: [], env: {floor: true, floorY: 0, ground: false, wall: false, wallZ: -40,
+          wallX: 0, wallYaw: 0, ceiling: false, ceilingY: 230}, wire: {on: false, joint: "chest", height: 300},
+          center: [0, 90, 0], cams: [], camLock: false, scale: {all: 100, head: 100, thick: 100}, hiddenDashed: false, torso3d: true, solids: [], auras: [], colors: {parts: {}}, others: [], figId: 1, figName: "1人目",
+          ruler: {on: false, n: 2, yaw: 30, lines: 20, cube: true, box: [60, 60, 60], pos: [70, 0, 0], extend: true, snap: true}};
+}
+// undo / redo: remember() keeps the state before an edit. A step remembered when nothing changed
+// after it (a slider only touched) is skipped; an edit after an undo drops what could be redone.
+const history = [], future = [];
+let futureAt = "";
+function remember(){ const t = JSON.stringify(S); if (history[history.length - 1] === t) return;
+  history.push(t); if (history.length > 80) history.shift(); }
+function restore(text){
+  const a = document.activeElement; if (a && a.type === "range") a.blur();
+  S = JSON.parse(text); syncUI(); draw(); futureAt = JSON.stringify(S);
+}
+function undo(){
+  const now = JSON.stringify(S);
+  while (history.length && history[history.length - 1] === now) history.pop();
+  if (!history.length) return;
+  if (now !== futureAt) future.length = 0;
+  future.push(now); restore(history.pop());
+}
+function redo(){
+  const now = JSON.stringify(S);
+  if (!future.length || now !== futureAt){ future.length = 0; return; }
+  if (history[history.length - 1] !== now) history.push(now);
+  restore(future.pop());
+}
+
+// ---- small vector helpers ----------------------------------------------------------------
+const sub = (a, b) => [a[0]-b[0], a[1]-b[1], a[2]-b[2]];
+const add = (a, b) => [a[0]+b[0], a[1]+b[1], a[2]+b[2]];
+const mul = (a, s) => [a[0]*s, a[1]*s, a[2]*s];
+const dot = (a, b) => a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+const cross = (a, b) => [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+const len = a => Math.hypot(a[0], a[1], a[2]);
+const norm = a => { const l = len(a) || 1; return [a[0]/l, a[1]/l, a[2]/l]; };
+function rotAxis(v, axis, ang){            // Rodrigues
+  const k = norm(axis), c = Math.cos(ang), s = Math.sin(ang);
+  return add(add(mul(v, c), mul(cross(k, v), s)), mul(k, dot(k, v) * (1 - c)));
+}
+function rotBetween(v, a, b){              // rotate v by the rotation taking a to b
+  const na = norm(a), nb = norm(b), ax = cross(na, nb), s = len(ax), c = dot(na, nb);
+  if (s < 1e-9) return c > 0 ? v.slice() : rotAxis(v, Math.abs(na[0]) < .9 ? cross(na, [1,0,0]) : cross(na, [0,1,0]), Math.PI);
+  return rotAxis(v, ax, Math.atan2(s, c));
+}
+const deg = d => d * Math.PI / 180;
+
+// ---- camera: world -> camera space -> screen ------------------------------------------------
+// camera space: x right, y up, z toward the viewer; the camera sits at z = D looking down -z.
+function camRot(v){
+  const c = S.cam;
+  let p = rotAxis(v, [0, 1, 0], deg(-c.yaw));
+  p = rotAxis(p, [1, 0, 0], deg(c.pitch));
+  return rotAxis(p, [0, 0, 1], deg(c.roll));
+}
+function camRotInv(v){
+  const c = S.cam;
+  let p = rotAxis(v, [0, 0, 1], deg(-c.roll));
+  p = rotAxis(p, [1, 0, 0], deg(-c.pitch));
+  return rotAxis(p, [0, 1, 0], deg(c.yaw));
+}
+// the picture's frame in a canvas of W x H: the largest rectangle of the picture's shape (the
+// export's width and height), centred. The front view fills its box, wider or taller than the
+// picture; the camera frames the picture in it just as in the file, and the rest shows around it.
+let frameAspect = 0;
+function frameWH(W, H){
+  if (!frameAspect){ const [EW, EH] = exportSize(); frameAspect = EW / EH; }
+  return W / H > frameAspect ? [H * frameAspect, H] : [W, W / frameAspect];
+}
+function lensF(W, H){ const [w, h] = frameWH(W, H); return S.cam.lens / 36 * Math.max(w, h); }
+function camDist(W, H){ return lensF(W, H) * 190 / (0.86 * frameWH(W, H)[1]) / S.cam.zoom; }   // 190 cm fills 86 % of the picture's height
+function toCam(p){ return camRot(sub(p, S.center)); }
+function project(p, W, H){
+  const q = toCam(p), f = lensF(W, H), D = camDist(W, H), d = Math.max(D - q[2], 1);
+  return {x: W/2 + f*q[0]/d, y: H/2 - f*q[1]/d, s: f/d, z: q[2]};
+}
+
+// the head's frame, for the face direction and the OpenPose nose / eyes / ears
+function headFrame(){
+  const P = S.P, up = norm(sub(P[IX.head], P[IX.neck]));
+  const across = norm(sub(P[IX.l_shoulder], P[IX.r_shoulder]));     // toward the figure's left
+  let fwd = norm(cross(across, up));
+  fwd = sub(fwd, mul(up, dot(fwd, up)));
+  // where the face looks: the neck's and the head's twist (左右を向く in the joint panel);
+  // nodding and tilting are the head bone's own 前後 / 左右
+  fwd = rotAxis(norm(fwd), up, deg((S.twist[IX.neck] || 0) + (S.twist[IX.head] || 0)));
+  const side = norm(cross(up, fwd));                                    // the figure's left
+  const up2 = norm(cross(fwd, side));
+  return {fwd, side, up: up2, r: S.R[IX.head]};
+}
+function facePoints(){
+  const h = headFrame(), c = S.P[IX.head], r = h.r;
+  const at = (f, s, u) => add(add(add(c, mul(h.fwd, f*r)), mul(h.side, s*r)), mul(h.up, u*r));
+  return {nose: at(0.95, 0, -0.2), r_eye: at(0.8, -0.35, 0.15), l_eye: at(0.8, 0.35, 0.15),
+          r_ear: at(0, -1.0, 0), l_ear: at(0, 1.0, 0)};
+}
+
+// ---- drawing: the アタリ (lines and circles) ----------------------------------------------
+const BONES = PARENT.map((p, i) => [p, i]).filter(([p]) => p >= 0);
+function cssVar(n){ return getComputedStyle(document.documentElement).getPropertyValue(n).trim(); }
+// the body's parts for line colours: a bone takes its child joint's part
+const PART_OF = {pelvis: "torso", waist: "torso", chest: "torso", r_shoulder: "torso", l_shoulder: "torso",
+  r_hip: "torso", l_hip: "torso", neck: "head", head: "head", r_elbow: "r_arm", r_wrist: "r_arm",
+  l_elbow: "l_arm", l_wrist: "l_arm", r_knee: "r_leg", r_ankle: "r_leg", r_toe: "r_leg",
+  l_knee: "l_leg", l_ankle: "l_leg", l_toe: "l_leg", r_hand: "r_hand", l_hand: "l_hand"};
+const partColor = g => (S.colors && S.colors.parts && S.colors.parts[g]) || "";
+// ---- hidden lines (S.hiddenDashed): what lies behind a body or a solid is drawn dashed ---------------
+// The bodies are spheres along the bones (the joints' circles as their thickness), the torso along
+// the spine, the head; the solids are their meshes (pose_solids.js). A point is hidden when the
+// camera's ray to it meets one of them first. Each figure's own neighbouring parts do not hide it.
+const TORSO_JOINTS = new Set([IX.pelvis, IX.waist, IX.chest, IX.neck, IX.r_shoulder, IX.l_shoulder, IX.r_hip, IX.l_hip]);
+let occMemo = {key: "", occ: null}, occFrozen = null;   // frozen while the figures are swapped in to be drawn
+function bodySpheres(fig){                    // the figure in S now
+  const out = [], P = S.P, R = S.R;
+  const put = (a, b, r, bone) => { const d = sub(b, a), L = len(d), n = Math.max(1, Math.ceil(L / Math.max(2, r)));
+    for (let k = 0; k <= n; k++) out.push({c: add(a, mul(d, k / n)), r, fig, bone}); };
+  BONES.forEach(([a, b]) => {
+    if (b === IX.head) return;
+    const r = TORSO_JOINTS.has(a) && TORSO_JOINTS.has(b) && (b === IX.waist || b === IX.chest || b === IX.neck)
+      ? R[IX.waist] * 0.8 : Math.max(2.5, Math.min(R[a] || 4, R[b] || 4) * 0.9);
+    put(P[a], P[b], r, b);
+  });
+  out.push({c: P[IX.head], r: R[IX.head], fig, bone: IX.head});
+  return out;
+}
+function occluders(W, H){
+  if (occFrozen) return occFrozen;
+  const figs = [S.P, ...(S.others || []).map(f => f.P)];
+  const key = [W, H, JSON.stringify(S.cam), JSON.stringify(S.center), JSON.stringify(figs), JSON.stringify(S.solids || [])].join("|");
+  if (occMemo.key === key) return occMemo.occ;
+  const spheres = bodySpheres(S.figId || 1);
+  for (const f of S.others || []){
+    if (typeof withFigure === "function") withFigure(f, () => spheres.push(...bodySpheres(f.figId || 0)));
+  }
+  const meshes = typeof solidMesh === "function" ? (S.solids || []).map((o, k) => ({mesh: solidMesh(o), solid: k})) : [];
+  const occ = {eye: add(camRotInv([0, 0, camDist(W, H)]), S.center), spheres, meshes};
+  occMemo = {key, occ};
+  return occ;
+}
+// the joints a bone (its child joint b) touches, and one step further
+function boneNear(b){ const s = new Set([b, PARENT[b]]); if (PARENT[b] >= 0) s.add(PARENT[PARENT[b]]); KIDS[b].forEach(k => s.add(k)); return s; }
+function jointNear(j){ const s = new Set([j, PARENT[j]]); KIDS[j].forEach(k => s.add(k)); return s; }
+const boneTouches = (bone, near) => near.has(bone) || near.has(PARENT[bone]);
+// skip rules: this figure's bones near a bone / a joint, its torso, or one solid
+const skipBone = b => { const near = boneNear(b), fig = S.figId || 1; return o => o.fig === fig && boneTouches(o.bone, near); };
+const skipJoint = j => { const near = jointNear(j), fig = S.figId || 1; return o => o.fig === fig && boneTouches(o.bone, near); };
+const skipTorso = () => { const fig = S.figId || 1; return o => o.fig === fig && (TORSO_JOINTS.has(o.bone) || TORSO_JOINTS.has(PARENT[o.bone])); };
+function hiddenAt(q, W, H, skip){
+  const o = occluders(W, H), d = sub(q, o.eye), dist = len(d);
+  if (dist < 1) return false;
+  const dir = mul(d, 1 / dist), limit = dist - 1.5;
+  for (const s of o.spheres){
+    if (skip && skip(s)) continue;
+    const oc = sub(o.eye, s.c), b = dot(oc, dir), c = dot(oc, oc) - s.r * s.r, disc = b * b - c;
+    if (disc < 0) continue;
+    const t = -b - Math.sqrt(disc);
+    if (t > 0 && t < limit) return true;
+  }
+  if (typeof rayHit === "function") for (const m of o.meshes){
+    if (skip && skip(m)) continue;
+    const t = rayHit(m.mesh, {o: o.eye, dir});
+    if (t !== null && t > 0 && t < limit) return true;
+  }
+  return false;
+}
+// a 3D segment: solid where it is seen, dashed where it is hidden (just solid when the switch is off)
+// (seenWH: the size of the view the hiding is judged in; the side view asks about the front one)
+function strokeSeen(ctx, a, b, W, H, skip, proj = project, seenWH = [W, H]){
+  const pa = proj(a, W, H), pb = proj(b, W, H);
+  if (!S.hiddenDashed){ ctx.beginPath(); ctx.moveTo(pa.x, pa.y); ctx.lineTo(pb.x, pb.y); ctx.stroke(); return; }
+  const n = Math.max(1, Math.min(14, Math.ceil(Math.hypot(pb.x - pa.x, pb.y - pa.y) / (10 * (devicePixelRatio || 1)))));
+  const lw = ctx.lineWidth, dash = [lw * 3, lw * 2.5];
+  let start = 0, prev = null;
+  const flush = (k0, k1, hid) => {
+    const p = proj(add(a, mul(sub(b, a), k0 / n)), W, H), q = proj(add(a, mul(sub(b, a), k1 / n)), W, H);
+    ctx.setLineDash(hid ? dash : []); ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(q.x, q.y); ctx.stroke();
+  };
+  for (let k = 0; k < n; k++){
+    const hid = hiddenAt(add(a, mul(sub(b, a), (k + 0.5) / n)), seenWH[0], seenWH[1], skip);
+    if (prev !== null && hid !== prev){ flush(start, k, prev); start = k; }
+    prev = hid;
+  }
+  flush(start, n, prev);
+  ctx.setLineDash([]);
+}
+function drawAtari(ctx, W, H, opts = {}){
+  if (S.P.length < J.length) upgradeState(S);
+  const P = S.P.map(p => project(p, W, H));
+  const ink = opts.ink || cssVar("--figure"), far = opts.far || cssVar("--far");
+  const lw = Math.max(1.5, W / 540);
+  ctx.lineCap = "round"; ctx.lineJoin = "round";
+  // far things first: bones and circles sorted by depth, farther drawn lighter in the editor
+  const items = [];
+  const tp = torsoParts();
+  if (S.torso3d) for (const c of torsoBoxes()){
+    const pp = c.map(q => project(q, W, H));
+    items.push({z: pp.reduce((m, q) => m + q.z, 0) / pp.length - 0.5, kind: "box", pp, q3: c});
+  }
+  else for (const poly of tp.blocks){
+    const pp = poly.map(q => project(q, W, H));
+    items.push({z: pp.reduce((m, q) => m + q.z, 0) / pp.length - 0.5, kind: "poly", pp, q3: poly});
+  }
+  const wl = tp.waistLine.map(q => project(q, W, H));
+  items.push({z: wl[1].z - 0.4, kind: "line", pp: wl, q3: tp.waistLine});
+  BONES.forEach(([a, b]) => { if (!TORSO_BONES.has(b) && !HAND_J.has(b)) items.push({z: (P[a].z + P[b].z)/2, kind: "bone", a, b}); });
+  J.forEach((_, i) => items.push({z: P[i].z + 0.01, kind: "joint", i}));
+  items.sort((u, v) => u.z - v.z);
+  // what lies well behind the body's middle (10 cm and more) is drawn lighter
+  const zs = P.map(p => p.z).sort((a, b) => a - b), zmid = zs[Math.floor(zs.length / 2)];
+  // a part's own line colour (S.colors.parts, pose_style.js) is kept behind the body, only fainter
+  const isFar = z => !(opts.flat || z > zmid - 10);
+  const shade = (z, g) => { const c = partColor(g);
+    ctx.globalAlpha = c && isFar(z) ? 0.55 : 1; return c || (isFar(z) ? far : ink); };
+  if (!opts.noFigure) for (const it of items){
+    if (it.kind === "line"){
+      ctx.strokeStyle = shade(it.z, "torso"); ctx.lineWidth = lw * 1.6;
+      for (let k = 1; k < it.q3.length; k++) strokeSeen(ctx, it.q3[k - 1], it.q3[k], W, H, skipTorso());
+      continue;
+    }
+    if (it.kind === "box"){
+      // the faces turned to the camera are filled and outlined; the edges behind the box are left
+      // out, or dashed with 隠れた線を破線に
+      const see = boxFacing(it.q3, add(camRotInv([0, 0, camDist(W, H)]), S.center));
+      if (!opts.flat){ ctx.fillStyle = opts.bg || cssVar("--stage"); ctx.globalAlpha = 0.55;
+        BOX_FACES.forEach((f, k) => { if (!see[k]) return; ctx.beginPath();
+          f.forEach((i, n) => n ? ctx.lineTo(it.pp[i].x, it.pp[i].y) : ctx.moveTo(it.pp[i].x, it.pp[i].y)); ctx.closePath(); ctx.fill(); });
+        ctx.globalAlpha = 1; }
+      ctx.strokeStyle = shade(it.z, "torso"); ctx.lineWidth = lw * 1.6;
+      for (const [a, b, f1, f2] of BOX_EDGES){
+        if (see[f1] || see[f2]) strokeSeen(ctx, it.q3[a], it.q3[b], W, H, skipTorso());
+        else if (S.hiddenDashed){ ctx.setLineDash([ctx.lineWidth * 3, ctx.lineWidth * 2.5]); ctx.beginPath();
+          ctx.moveTo(it.pp[a].x, it.pp[a].y); ctx.lineTo(it.pp[b].x, it.pp[b].y); ctx.stroke(); ctx.setLineDash([]); }
+      }
+      continue;
+    }
+    if (it.kind === "poly"){
+      ctx.beginPath(); it.pp.forEach((q, k) => k ? ctx.lineTo(q.x, q.y) : ctx.moveTo(q.x, q.y)); ctx.closePath();
+      if (!opts.flat){ ctx.fillStyle = opts.bg || cssVar("--stage"); ctx.globalAlpha = 0.55; ctx.fill(); ctx.globalAlpha = 1; }
+      ctx.strokeStyle = shade(it.z, "torso"); ctx.lineWidth = lw * 1.6;
+      it.q3.forEach((q, k) => strokeSeen(ctx, q, it.q3[(k + 1) % it.q3.length], W, H, skipTorso()));
+      continue;
+    }
+    if (it.kind === "bone"){
+      ctx.strokeStyle = shade(it.z, PART_OF[J[it.b]]); ctx.lineWidth = lw * 1.4;
+      strokeSeen(ctx, S.P[it.a], S.P[it.b], W, H, skipBone(it.b));
+    } else {
+      const i = it.i, p = P[i], r = handleR(i) * p.s;
+      if (HANDLE.has(i) && opts.export) continue;           // handles are for the editor only
+      ctx.strokeStyle = HANDLE.has(i) ? far : shade(it.z, PART_OF[J[i]]); ctx.lineWidth = lw * (i === IX.head ? 1.6 : 1.1);
+      if (!opts.flat){ ctx.fillStyle = opts.bg || cssVar("--stage"); ctx.globalAlpha = 0.55;
+        ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, 2*Math.PI); ctx.fill(); ctx.globalAlpha = 1; }
+      const hid = S.hiddenDashed && hiddenAt(S.P[i], W, H, skipJoint(i));
+      if (hid) ctx.setLineDash([ctx.lineWidth * 3, ctx.lineWidth * 2.5]);
+      ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, 2*Math.PI); ctx.stroke(); ctx.setLineDash([]);
+      if (opts.sel === i){ ctx.strokeStyle = cssVar("--sel"); ctx.lineWidth = lw * 2;
+        ctx.beginPath(); ctx.arc(p.x, p.y, r + 3*lw, 0, 2*Math.PI); ctx.stroke(); }
+    }
+    ctx.globalAlpha = 1;
+  }
+  // the face's centre lines (where the head looks), like a Loomis cross
+  if (!opts.noFigure){
+  const h = headFrame(), c = S.P[IX.head], r = h.r;
+  ctx.strokeStyle = partColor("head") || ink; ctx.lineWidth = lw;
+  if (S.hiddenDashed && hiddenAt(c, W, H, skipJoint(IX.head))) ctx.setLineDash([lw * 3, lw * 2.5]);
+  const arc = (fn) => { ctx.beginPath(); for (let k = 0; k <= 24; k++){
+      const t = -Math.PI/2 + Math.PI * k/24, q = project(fn(t), W, H);
+      k ? ctx.lineTo(q.x, q.y) : ctx.moveTo(q.x, q.y); } ctx.stroke(); };
+  arc(t => add(c, add(mul(h.fwd, r*Math.cos(t)), mul(h.up, r*Math.sin(t)))));        // vertical
+  arc(t => add(c, add(mul(h.fwd, r*Math.cos(t)), mul(h.side, r*Math.sin(t)))));      // eye line
+  ctx.setLineDash([]);
+  // pinned joints: a small filled square (editor only)
+  if (!opts.export) for (const k of Object.keys(S.pins || {})){
+    const q = P[+k]; ctx.fillStyle = cssVar("--sel"); ctx.fillRect(q.x - 3*lw, q.y - 3*lw, 6*lw, 6*lw);
+  }
+  }
+  // the scene: floor, walls, things held and placed (pose_scene.js)
+  if (typeof drawScene === "function") drawScene(ctx, W, H, opts, project, ink, far, lw);
+  // hands: a small fan of the fingers
+  if (!opts.noFigure) for (const side of ["r", "l"]){
+    ctx.setLineDash([]);
+    const pts = handPoints(side, W, H);
+    ctx.strokeStyle = partColor(side + "_hand") || ink; ctx.lineWidth = lw * 0.9;
+    const hw = IX[side + "_wrist"];
+    ctx.setLineDash(S.hiddenDashed && hiddenAt(S.P[hw], W, H, skipJoint(hw)) ? [lw * 2.5, lw * 2] : []);
+    HAND_EDGES.forEach(([a, b]) => { ctx.beginPath(); ctx.moveTo(pts[a][0], pts[a][1]); ctx.lineTo(pts[b][0], pts[b][1]); ctx.stroke(); });
+  }
+  ctx.setLineDash([]);
+}
+
+// the torso as a mannequin draws it: the chest block (shoulder line -> under the ribs) and the
+// pelvis block (its top -> the thigh roots, crotch level) are two separate trapezoids; the
+// waist between them is a line through the waist joint, where the body bends
+const TORSO_BONES = new Set([IX.waist, IX.chest, IX.r_shoulder, IX.l_shoulder, IX.r_hip, IX.l_hip]);
+const GAP = 0.45;                       // how far toward the waist each block stops (0..1)
+function torsoParts(){
+  const P = S.P, R = S.R, w = P[IX.waist];
+  const acrossChest = norm(sub(P[IX.l_shoulder], P[IX.r_shoulder]));
+  const acrossHips = norm(sub(P[IX.l_hip], P[IX.r_hip]));
+  const ribs = add(w, mul(sub(P[IX.chest], w), GAP));         // under the chest block
+  const pelvisTop = add(w, mul(sub(P[IX.pelvis], w), GAP));   // top of the pelvis block
+  const half = R[IX.waist];
+  const hipOut = side => { const h = P[IX[side + "_hip"]];
+    return add(h, mul(acrossHips, (side === "l" ? 1 : -1) * R[IX[side + "_hip"]] * 0.9)); };
+  const chestBlock = [P[IX.r_shoulder], P[IX.l_shoulder],
+                      add(ribs, mul(acrossChest, half)), add(ribs, mul(acrossChest, -half))];
+  const pelvisBlock = [add(pelvisTop, mul(acrossHips, -half * 1.05)), add(pelvisTop, mul(acrossHips, half * 1.05)),
+                       hipOut("l"), hipOut("r")];
+  return {blocks: [chestBlock, pelvisBlock], waistLine: [ribs, w, pelvisTop]};
+}
+function torso(){ return torsoParts().blocks; }
+// 胴体を立体に (S.torso3d, on by default): each trapezoid becomes a box along the body's front, its
+// front and back faces the trapezoid moved forward and back. The ribcage is deepest at the
+// shoulders, the pelvis at the hips. Faces: [corner indices], corners 0-3 front, 4-7 back.
+const BOX_FACES = [[0, 1, 2, 3], [7, 6, 5, 4], [0, 4, 5, 1], [1, 5, 6, 2], [2, 6, 7, 3], [3, 7, 4, 0]];
+const BOX_EDGES = [[0, 1, 0, 2], [1, 2, 0, 3], [2, 3, 0, 4], [3, 0, 0, 5], [4, 5, 1, 2], [5, 6, 1, 3], [6, 7, 1, 4],
+                   [7, 4, 1, 5], [0, 4, 2, 5], [1, 5, 2, 3], [2, 6, 3, 4], [3, 7, 4, 5]];   // [a, b, face, face]
+function torsoBoxes(){
+  const P = S.P, half = S.R[IX.waist], tp = torsoParts();
+  const box = (quad, across, up, [dTop, dBottom]) => {
+    let u = sub(up, mul(across, dot(up, across))); u = norm(u);
+    const fwd = norm(cross(across, u)), d = [dTop, dTop, dBottom, dBottom].map(k => k * half);
+    return [...quad.map((q, k) => add(q, mul(fwd, d[k]))), ...quad.map((q, k) => add(q, mul(fwd, -d[k])))];
+  };
+  return [box(tp.blocks[0], norm(sub(P[IX.l_shoulder], P[IX.r_shoulder])), sub(P[IX.neck], P[IX.waist]), [0.75, 0.68]),
+          box(tp.blocks[1], norm(sub(P[IX.l_hip], P[IX.r_hip])), sub(P[IX.waist], P[IX.pelvis]), [0.62, 0.8])];
+}
+// which faces of a box look at the camera
+function boxFacing(c, eye){
+  const mid = mul(c.reduce((m, q) => add(m, q), [0, 0, 0]), 1 / c.length);
+  return BOX_FACES.map(f => { const q = f.map(i => c[i]), fc = mul(add(add(q[0], q[1]), add(q[2], q[3])), 0.25);
+    let n = cross(sub(q[1], q[0]), sub(q[3], q[0])); if (dot(n, sub(fc, mid)) < 0) n = mul(n, -1);
+    return dot(n, sub(eye, fc)) > 0; });
+}
+
+// ---- hands: 21 OpenPose points from the hand shape, in 3D --------------------------------------
+const HAND_EDGES = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[0,9],[9,10],[10,11],[11,12],
+                    [0,13],[13,14],[14,15],[15,16],[0,17],[17,18],[18,19],[19,20]];
+// the hand's frame: origin in the middle of the fist, z along the hand (wrist -> knuckles), y toward
+// the thumb, x toward the palm. The forearm's frame (its twist) is carried over the wrist's bend,
+// so a bent wrist turns the fingers and what the hand holds (pose_scene.js).
+function handFrame(side){
+  const el = S.P[IX[side + "_elbow"]], wr = S.P[IX[side + "_wrist"]], hd = S.P[IX[side + "_hand"]];
+  const z0 = norm(sub(wr, el)), z = hd ? norm(sub(hd, wr)) : z0;
+  const ref = add(bodyFront(), mul(bodyRot([0, 1, 0]), 0.4));
+  let y = sub(ref, mul(z0, dot(ref, z0)));
+  if (len(y) < 1e-4) y = cross(z0, [1, 0, 0]);
+  const tw = (S.twist[IX[side + "_wrist"]] || 0) + (S.twist[IX[side + "_hand"]] || 0);
+  y = rotAxis(norm(y), z0, deg(tw));       // the same way as setTwist turns the bones (mirrored twists mirror)
+  y = norm(rotBetween(y, z0, z));
+  const x = mul(norm(cross(y, z)), side === "r" ? 1 : -1);
+  return {o: add(wr, mul(z, 7)), x, y, z};
+}
+// the fingers in the hand's frame, for an 8 cm hand (wrist -> knuckles): root [x, y, z] cm, the
+// direction it starts in (deg toward the thumb across the palm; the thumb also toward the palm),
+// its three segments, and how far each of its joints bends at a full curl (deg)
+const FINGERS = [
+  {root: [0.6, 2.2, 1.4], spread: 55, palm: 0.35, segs: [3.6, 3.0, 2.5], bend: [30, 55, 70], thumb: true},
+  {root: [0, 3.0, 8.0], spread: 7, segs: [4.0, 2.5, 2.0], bend: [80, 100, 70]},
+  {root: [0, 1.0, 8.3], spread: 0, segs: [4.5, 2.8, 2.2], bend: [80, 100, 70]},
+  {root: [0, -1.0, 8.0], spread: -6, segs: [4.2, 2.6, 2.0], bend: [80, 100, 70]},
+  {root: [0, -2.8, 7.3], spread: -13, segs: [3.3, 2.0, 1.8], bend: [80, 100, 70]}];
+// the 21 points in the world: the wrist, then thumb, index, middle, ring and little finger, each
+// root -> tip. A finger curls by bending toward the palm at each of its joints, so a fist shows
+// the back of the hand and its knuckles, and which way the palm faces reads at a glance.
+function handPoints3D(side){
+  const f = handFrame(side), wr = S.P[IX[side + "_wrist"]], hd = S.P[IX[side + "_hand"]];
+  const k = (hd ? len(sub(hd, wr)) : HAND_LEN) / HAND_LEN;
+  const at = v => add(wr, mul(add(add(mul(f.x, v[0]), mul(f.y, v[1])), mul(f.z, v[2])), k));
+  const curl = HANDS[S.hands[side]] || HANDS.relaxed;
+  const out = [wr];
+  FINGERS.forEach((g, n) => {
+    const sp = deg(g.spread);
+    let d = add(mul(f.z, Math.cos(sp)), mul(f.y, Math.sin(sp)));
+    if (g.palm) d = add(d, mul(f.x, g.palm));
+    d = norm(d);
+    // the way it bends: toward the palm (the thumb: toward the palm and across it)
+    let toward = g.thumb ? norm(sub(mul(f.x, 0.75), mul(f.y, 0.65))) : f.x;
+    let p = at(g.root); out.push(p);
+    g.segs.forEach((L, s) => {
+      const t = sub(toward, mul(d, dot(toward, d)));
+      if (len(t) > 1e-6){ const a = deg(curl[n] * g.bend[s]); d = norm(add(mul(d, Math.cos(a)), mul(norm(t), Math.sin(a)))); }
+      p = add(p, mul(d, L * k)); out.push(p);
+    });
+  });
+  return out;
+}
+function handPoints(side, W, H){
+  return handPoints3D(side).map(p => { const q = project(p, W, H); return [q.x, q.y]; });
+}
+
+// ---- OpenPose picture -----------------------------------------------------------------------
+const OP_COLORS = [[255,0,0],[255,85,0],[255,170,0],[255,255,0],[170,255,0],[85,255,0],[0,255,0],
+  [0,255,85],[0,255,170],[0,255,255],[0,170,255],[0,85,255],[0,0,255],[85,0,255],[170,0,255],
+  [255,0,255],[255,0,170],[255,0,85]];
+const OP_LIMBS = [[1,2],[1,5],[2,3],[3,4],[5,6],[6,7],[1,8],[8,9],[9,10],[1,11],[11,12],[12,13],
+                  [1,0],[0,14],[14,16],[0,15],[15,17]];
+function openposePoints(W, H){
+  const f = facePoints(), P = S.P;
+  const neck = P[IX.neck];
+  const order = [f.nose, neck, P[IX.r_shoulder], P[IX.r_elbow], P[IX.r_wrist], P[IX.l_shoulder],
+                 P[IX.l_elbow], P[IX.l_wrist], P[IX.r_hip], P[IX.r_knee], P[IX.r_ankle],
+                 P[IX.l_hip], P[IX.l_knee], P[IX.l_ankle], f.r_eye, f.l_eye, f.r_ear, f.l_ear];
+  return order.map(p => project(p, W, H));
+}
+function drawOpenpose(ctx, W, H, noBg){
+  if (!noBg){ ctx.fillStyle = "#000"; ctx.fillRect(0, 0, W, H); }
+  const K = openposePoints(W, H), sw = Math.max(2, Math.round(4 * Math.max(W, H) / 1024));
+  OP_LIMBS.forEach(([a, b], i) => {
+    const pa = K[a], pb = K[b], mx = (pa.x + pb.x)/2, my = (pa.y + pb.y)/2;
+    const l = Math.hypot(pa.x - pb.x, pa.y - pb.y), ang = Math.atan2(pa.y - pb.y, pa.x - pb.x);
+    ctx.fillStyle = `rgba(${OP_COLORS[i].join(",")},0.6)`;
+    ctx.beginPath(); ctx.ellipse(mx, my, l/2, sw, ang, 0, 2*Math.PI); ctx.fill();
+  });
+  K.forEach((p, i) => { ctx.fillStyle = `rgb(${OP_COLORS[i].join(",")})`;
+    ctx.beginPath(); ctx.arc(p.x, p.y, sw, 0, 2*Math.PI); ctx.fill(); });
+  for (const side of ["r", "l"]){
+    const pts = handPoints(side, W, H), hw = Math.max(1, sw * 0.5);
+    HAND_EDGES.forEach(([a, b], i) => {
+      const hsv = i / HAND_EDGES.length, c = hsvToRgb(hsv, 1, 1);
+      ctx.strokeStyle = `rgb(${c.join(",")})`; ctx.lineWidth = hw * 2; ctx.lineCap = "round";
+      ctx.beginPath(); ctx.moveTo(pts[a][0], pts[a][1]); ctx.lineTo(pts[b][0], pts[b][1]); ctx.stroke();
+    });
+    pts.forEach(p => { ctx.fillStyle = "rgb(0,0,255)"; ctx.beginPath(); ctx.arc(p[0], p[1], hw * 1.4, 0, 2*Math.PI); ctx.fill(); });
+  }
+}
+function hsvToRgb(h, s, v){
+  const i = Math.floor(h * 6), f = h * 6 - i, p = v*(1-s), q = v*(1-f*s), t = v*(1-(1-f)*s);
+  const [r, g, b] = [[v,t,p],[q,v,p],[p,v,t],[p,q,v],[t,p,v],[v,p,q]][i % 6];
+  return [r, g, b].map(x => Math.round(x * 255));
+}
+
+// ---- the two views ------------------------------------------------------------------------
+const front = document.getElementById("front"), side = document.getElementById("side");
+let sel = -1, mode = "pose";
+function exportSize(){ return [Math.max(256, +$("W").value || 1080), Math.max(256, +$("H").value || 1920)]; }
+// the height of what sits around the views in their panel (modes, keys, hints), measured again
+// when the window, the mode or the layout changes
+let chromeKey = "", chromeH = 160;
+function viewChrome(){
+  const views = front.closest(".views");
+  // the views' box as a whole is left out (with the side view under the front one it is part of it)
+  const sec = front.closest("section"), key = [innerWidth, innerHeight, document.body.className, views.className].join("|");
+  if (sec && key !== chromeKey){ chromeKey = key; chromeH = Math.max(0, sec.offsetHeight - views.offsetHeight); }
+  return chromeH;
+}
+// the side view above or below the front one: placed so (横の図の置き場所), or on a phone held
+// upright, where it goes under the front one when asked for
+const PHONE = "(max-width:700px)";
+function sideStacked(){
+  if (!side.parentElement.getClientRects().length) return false;
+  return matchMedia(PHONE).matches || /\bside-(top|bottom)\b/.test(front.closest(".views").className);
+}
+const ONE_COLUMN = "(max-width:900px), (orientation:portrait) and (max-aspect-ratio:4/5)";
+// The views' height (maxH) and whether they have a room of their own (room: beside the panel, a
+// strip, split screen, put away), else (one column, the page scrolls) a view is as tall as the
+// picture's shape asks, up to its share of the window.
+function viewsRoom(){
+  // the views stay on screen as the page scrolls: beside the panels they may take the window's
+  // height, above them (one column) part of it, so the panels show underneath
+  const short = innerHeight <= 520 && innerWidth >= 700;          // a phone held sideways: panels beside
+  // the panel above or below the views (操作欄の位置): a strip, the views take the rest; put away
+  // (しまう): the views take the whole height
+  const bc = document.body.classList, own = !bc.contains("split"), off = own && bc.contains("aside-off");
+  const stackedPanel = own && !off && (bc.contains("aside-top") || bc.contains("aside-bottom"));
+  const strip = stackedPanel ? document.querySelector("aside").offsetHeight + document.querySelector(".app-header").offsetHeight + 40 : 0;
+  const share = stackedPanel ? Math.max(0.3, 1 - strip / (innerHeight || 800))
+    : off || short || !matchMedia(ONE_COLUMN).matches ? 1 : innerWidth <= 700 ? 0.8 : 0.7;
+  // split screen: the views' own half of the screen
+  const st = document.body.classList.contains("split") ? document.getElementById("stage") : null;
+  const maxH = st ? Math.max(120, st.clientHeight - viewChrome() - 10)
+    : Math.max(200, Math.round((window.innerHeight || 800) * share - viewChrome() - 18));
+  return {maxH, room: !!(st || stackedPanel || off || short || !matchMedia(ONE_COLUMN).matches)};
+}
+// A view fills its box's width. fixedH: the side view above or below the front one keeps to that
+// height; reserve: what that side view takes of the front one's height (with the gap).
+function fitCanvas(cv, aspect, fixedH, reserve = 0){
+  const dpr = window.devicePixelRatio || 1;
+  let w = cv.parentElement.clientWidth, h = Math.round(w / aspect);
+  const r = fixedH ? {maxH: fixedH, room: true} : viewsRoom(), maxH = Math.max(80, r.maxH - reserve);
+  h = r.room ? maxH : Math.min(h, maxH);
+  cv.width = Math.max(1, Math.round(w * dpr)); cv.height = Math.max(1, Math.round(h * dpr));
+  cv.style.width = w + "px"; cv.style.height = h + "px";
+}
+// the side view looks from the camera's right but stays level: only the camera's direction (yaw)
+// turns it, not its height angle or tilt
+const sideRot = v => rotAxis(v, [0, 1, 0], deg(-S.cam.yaw)), sideRotInv = v => rotAxis(v, [0, 1, 0], deg(S.cam.yaw));
+function sideProject(p, W, H){                // orthographic, from the camera's right: depth across
+  const q = sideRot(sub(p, S.center)), k = 0.86 * H / 190;
+  return {x: W/2 - q[2] * k, y: H/2 - q[1] * k, s: k};
+}
+function draw(){
+  const [EW, EH] = exportSize();
+  frameAspect = EW / EH;
+  // the side view above or below: its own height, out of the views' (up to 4 parts of 10; on a
+  // wider screen also up to about a quarter of the window)
+  let sideH = 0, gap = 0;
+  if (sideStacked()){
+    gap = parseFloat(getComputedStyle(front.closest(".views")).rowGap) || 0;
+    const cap = matchMedia(PHONE).matches ? Infinity : Math.max(100, (innerHeight || 800) * 0.26);
+    sideH = Math.max(80, Math.round(Math.min(cap, (viewsRoom().maxH - gap) * 0.4)));
+  }
+  fitCanvas(front, EW / EH, 0, sideH ? sideH + gap : 0); fitCanvas(side, EW / EH, sideH); zoomThumb();
+  let ctx = front.getContext("2d"), W = front.width, H = front.height;
+  ctx.fillStyle = cssVar("--stage"); ctx.fillRect(0, 0, W, H);
+  // outside the picture's frame: a light shade and the frame's edge (not in the file)
+  { const [fw, fh] = frameWH(W, H), fx = (W - fw) / 2, fy = (H - fh) / 2;
+    if (fx > 1 || fy > 1){ ctx.save(); ctx.fillStyle = cssVar("--far"); ctx.globalAlpha = 0.08;
+      ctx.fillRect(0, 0, W, fy); ctx.fillRect(0, fy + fh, W, H - fy - fh); ctx.fillRect(0, fy, fx, fh); ctx.fillRect(fx + fw, fy, W - fx - fw, fh);
+      ctx.globalAlpha = 0.7; ctx.strokeStyle = cssVar("--far"); ctx.lineWidth = devicePixelRatio || 1; ctx.setLineDash([6, 4].map(v => v * (devicePixelRatio || 1)));
+      ctx.strokeRect(fx + 0.5, fy + 0.5, fw - 1, fh - 1); ctx.restore(); } }
+  drawAtari(ctx, W, H, {sel});
+  // side view
+  ctx = side.getContext("2d"); W = side.width; H = side.height;
+  ctx.fillStyle = cssVar("--stage"); ctx.fillRect(0, 0, W, H);
+  ctx.strokeStyle = cssVar("--line"); ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(W/2, 0); ctx.lineTo(W/2, H); ctx.stroke();
+  ctx.fillStyle = cssVar("--sub"); ctx.font = `${Math.round(11 * (devicePixelRatio || 1))}px sans-serif`;
+  ctx.fillText("← カメラ側", 6, H - 8);
+  // the parts' line colours, and the lines hidden from the camera dashed, as in the front view
+  const FW = front.width, FH = front.height, seen = [FW, FH];
+  const sideFigure = (active, first) => {
+    const P = S.P.map(p => sideProject(p, W, H)), ink = cssVar(active ? "--figure" : "--far");
+    const col = g => partColor(g) || ink;
+    ctx.lineWidth = Math.max(1.2, W / 260);
+    BONES.forEach(([a, b]) => { if (HAND_J.has(b)) return; ctx.strokeStyle = col(PART_OF[J[b]]);
+      strokeSeen(ctx, S.P[a], S.P[b], W, H, skipBone(b), sideProject, seen); });
+    const tps = torsoParts();
+    ctx.strokeStyle = col("torso");
+    if (S.torso3d) for (const c of torsoBoxes()) for (const [a, b] of BOX_EDGES) strokeSeen(ctx, c[a], c[b], W, H, skipTorso(), sideProject, seen);
+    else for (const poly of tps.blocks) poly.forEach((q, k) => strokeSeen(ctx, q, poly[(k + 1) % poly.length], W, H, skipTorso(), sideProject, seen));
+    for (let k = 1; k < tps.waistLine.length; k++) strokeSeen(ctx, tps.waistLine[k - 1], tps.waistLine[k], W, H, skipTorso(), sideProject, seen);
+    P.forEach((p, i) => {
+      ctx.strokeStyle = active && i === sel ? cssVar("--sel") : HANDLE.has(i) ? cssVar("--far") : col(PART_OF[J[i]]);
+      if (S.hiddenDashed && hiddenAt(S.P[i], FW, FH, skipJoint(i))) ctx.setLineDash([ctx.lineWidth * 3, ctx.lineWidth * 2.5]);
+      ctx.beginPath(); ctx.arc(p.x, p.y, Math.max(2, handleR(i) * p.s), 0, 2*Math.PI); ctx.stroke(); ctx.setLineDash([]); });
+    if (typeof drawScene === "function")
+      drawScene(ctx, W, H, {side: true, noEnv: !first}, sideProject, ink, cssVar("--far"), Math.max(1, W / 360));
+  };
+  occFrozen = S.hiddenDashed ? occluders(FW, FH) : null;
+  try { if (typeof everyFigure === "function") everyFigure(sideFigure); else sideFigure(true, true); }
+  finally { occFrozen = null; }
+  const hgt = standingHeight();
+  $("headsV").textContent = (hgt / (2 * S.R[IX.head])).toFixed(1) + " 頭身";
+  if (document.activeElement !== $("heightN")) $("heightN").value = hgt.toFixed(1);
+  $("heightP").textContent = `${hgt.toFixed(1)} cm（${(hgt / (2 * S.R[IX.head])).toFixed(1)} 頭身）`;
+  showSelected(); camCoords(); figCoords();
+}
+// standing height from the bone lengths (whatever the pose): crown to the floor
+const bl = (a, b) => len(sub(S.P[IX[a]], S.P[IX[b]]));
+function standingHeight(){
+  const upper = S.R[IX.head] + bl("head", "neck") + bl("neck", "chest") + bl("chest", "waist") + bl("waist", "pelvis");
+  const leg = s => bl(s + "_hip", "pelvis") * 0.29 + bl(s + "_knee", s + "_hip") + bl(s + "_ankle", s + "_knee")
+    + bl(s + "_toe", s + "_ankle") * 0.55;
+  return upper + (leg("r") + leg("l")) / 2;
+}
+function headsCount(){ return standingHeight() / (2 * S.R[IX.head]); }
+
+// ---- picking and dragging ------------------------------------------------------------------
+function evPos(cv, e){ const r = cv.getBoundingClientRect(), k = cv.width / r.width;
+  return [(e.clientX - r.left) * k, (e.clientY - r.top) * k]; }
+function pick(cv, x, y){
+  const W = cv.width, H = cv.height, isSide = cv === side;
+  let best = -1, bd = 1e9;
+  S.P.forEach((p, i) => {
+    const q = isSide ? sideProject(p, W, H) : project(p, W, H);
+    const d = Math.hypot(q.x - x, q.y - y) - Math.max(8, handleR(i) * q.s);
+    if (d < bd){ bd = d; best = i; }
+  });
+  return bd < 14 * pointerScale() * (devicePixelRatio || 1) ? best : -1;
+}
+function rotateSubtree(i, newPos){            // turn the bone parent->i so i lands on newPos
+  const p = S.P[PARENT[i]], a = sub(S.P[i], p), b = sub(newPos, p);
+  for (const k of subtree(i)) S.P[k] = add(p, rotBetween(sub(S.P[k], p), a, b));
+}
+function moveSubtree(i, delta){ for (const k of subtree(i)) S.P[k] = add(S.P[k], delta); }
+
+// pose mode, front view: keep the bone's length, solve the depth along the view ray
+function dragPose(i, x, y, W, H){
+  if (i === IX.pelvis){                       // the whole figure, in the picture plane
+    const q = project(S.P[i], W, H), dW = camRotInv([(x - q.x) / q.s, -(y - q.y) / q.s, 0]);
+    S.P = S.P.map(p => add(p, dW)); return;
+  }
+  const par = PARENT[i], L = len(sub(S.P[i], S.P[par]));
+  const f = lensF(W, H), D = camDist(W, H);
+  const pc = toCam(S.P[par]), ic = toCam(S.P[i]);
+  const dir = norm([(x - W/2) / f, -(y - H/2) / f, -1]), O = [0, 0, D];
+  const op = sub(O, pc), bq = dot(dir, op), cq = dot(op, op) - L*L, disc = bq*bq - cq;
+  let target;
+  if (disc >= 0){
+    const t1 = -bq - Math.sqrt(disc), t2 = -bq + Math.sqrt(disc);
+    const c1 = add(O, mul(dir, t1)), c2 = add(O, mul(dir, t2));
+    // keep the side (toward the camera or away) the bone was on
+    const was = ic[2] - pc[2];
+    target = Math.abs((c1[2] - pc[2]) - was) <= Math.abs((c2[2] - pc[2]) - was) ? c1 : c2;
+  } else {                                    // out of reach: the bone points at the mouse
+    const t = -bq, close = add(O, mul(dir, t));
+    target = add(pc, mul(norm(sub(close, pc)), L));
+  }
+  rotateSubtree(i, add(camRotInv(target), S.center));
+}
+// wrists and ankles: the whole limb reaches (two-bone IK), the elbow / knee bends the way it
+// already bends; the hand stays at its depth from the camera
+const IK_END = {r_wrist: 1, l_wrist: 1, r_ankle: 1, l_ankle: 1};
+function dragIK(i, x, y, W, H){
+  const mid = PARENT[i], root = PARENT[mid];
+  const f = lensF(W, H), D = camDist(W, H);
+  const ec = toCam(S.P[i]), dir = norm([(x - W/2) / f, -(y - H/2) / f, -1]);
+  const t = (ec[2] - D) / dir[2], T = add([0, 0, D], mul(dir, t));          // same depth
+  const rc = toCam(S.P[root]), mc = toCam(S.P[mid]);
+  const L1 = len(sub(mc, rc)), L2 = len(sub(ec, mc));
+  let toT = sub(T, rc); let c = len(toT);
+  c = Math.max(Math.abs(L1 - L2) + 1e-3, Math.min(L1 + L2 - 1e-3, c));
+  const dT = norm(toT);
+  let pole = sub(mc, rc); pole = sub(pole, mul(dT, dot(pole, dT)));
+  if (len(pole) < 0.15 * L1){
+    // a straight limb has no bend to keep: knees bend forward, elbows backward
+    const across = norm(sub(S.P[IX.l_shoulder], S.P[IX.r_shoulder]));
+    const fwd = camRot(norm(cross(across, [0, 1, 0])));
+    pole = mul(fwd, J[i].endsWith("ankle") ? 1 : -1);
+    pole = sub(pole, mul(dT, dot(pole, dT)));
+    if (len(pole) < 1e-6) pole = cross(dT, [0, 0, 1]);
+  }
+  const pn = norm(pole);
+  const cosA = Math.max(-1, Math.min(1, (L1*L1 + c*c - L2*L2) / (2 * L1 * c)));
+  const elbow = add(rc, add(mul(dT, L1 * cosA), mul(pn, L1 * Math.sqrt(1 - cosA*cosA))));
+  rotateSubtree(mid, add(camRotInv(elbow), S.center));
+  const end = add(rc, mul(dT, c));
+  rotateSubtree(i, add(camRotInv(end), S.center));
+}
+// side view: depth and height of the camera space, the bone's length kept
+function dragSide(i, x, y, W, H){
+  if (i === IX.pelvis) return;
+  const par = PARENT[i], L = len(sub(S.P[i], S.P[par]));
+  const k = 0.86 * H / 190, pc = sideRot(sub(S.P[par], S.center)), ic = sideRot(sub(S.P[i], S.center));
+  const want = [ic[0], (H/2 - y) / k, (W/2 - x) / k];
+  const v = norm(sub(want, pc));
+  rotateSubtree(i, add(sideRotInv(add(pc, mul(v, L))), S.center));
+}
+// body mode: stretch the bone parent->i toward the mouse (the rest of the limb comes along)
+function dragBody(i, x, y, W, H){
+  if (i === IX.pelvis) return;
+  const par = PARENT[i], a = project(S.P[par], W, H), b = project(S.P[i], W, H);
+  const sl = Math.hypot(b.x - a.x, b.y - a.y) || 1;
+  const along = ((x - a.x) * (b.x - a.x) + (y - a.y) * (b.y - a.y)) / sl;
+  const ratio = Math.max(0.2, Math.min(4, along / sl));
+  const apply = j => { const pj = PARENT[j], v = sub(S.P[j], S.P[pj]);
+    moveSubtree(j, mul(v, ratio - 1)); };
+  apply(i);
+  if ($("sym").checked && MIRROR[i] !== i) apply(MIRROR[i]);
+}
+let drag = null;
+let rangeHeld = null;                 // the slider being held (see the panel's pointer events)
+// handles added by pose_solids.js / pose_ruler.js: a down hook returns a drag {move(x, y, e)} or
+// null; a wheel hook returns true when it used the wheel. Hooks run first in the order added.
+const DOWN_HOOKS = [], WHEEL_HOOKS = [];
+// ---- one input for mouse, touch and pens (pointer events) -----------------------------------
+// Keys a touch screen has not: the on-screen 「Shift」「固定」 toggles stand for Shift and Alt; a
+// pen's barrel button and the mouse's right button act as Shift, a pen's eraser end as Alt. The
+// hooks get the same view of the event: {shiftKey, altKey, ctrlKey, metaKey, pointerType,
+// clientX, clientY, ..., original (the PointerEvent)}.
+const VMOD = {shift: false, alt: false};
+let lastPointer = "mouse";
+const pointerScale = () => (lastPointer === "touch" ? 1.9 : lastPointer === "pen" ? 1.25 : 1);
+function evMods(e){
+  const b = e.buttons || 0;
+  return {shiftKey: !!(e.shiftKey || VMOD.shift || (b & 2) || e.button === 2),
+          altKey: !!(e.altKey || VMOD.alt || (b & 32) || e.button === 5),
+          ctrlKey: !!e.ctrlKey, metaKey: !!e.metaKey, pointerType: e.pointerType || "mouse",
+          pointerId: e.pointerId, button: e.button, buttons: b, pressure: e.pressure,
+          clientX: e.clientX, clientY: e.clientY, preventDefault: () => e.preventDefault(), original: e};
+}
+// draw at most once a frame while dragging (phones and tablets send many moves)
+let drawQueued = false;
+function drawSoon(){ if (drawQueued) return; drawQueued = true; requestAnimationFrame(() => { drawQueued = false; draw(); }); }
+function down(cv, e){
+  const [x, y] = evPos(cv, e);
+  // the camera as in Blender: the middle button turns the view (Shift: moves it, Ctrl: zooms);
+  // Alt+drag where there is no joint does the same (a mouse or trackpad without a middle button)
+  if (cv === front && e.pointerType !== "touch" && (e.button === 1 || (e.altKey && pick(cv, x, y) < 0))){
+    if (camHeld()) return;
+    remember(); drag = {nav: e.ctrlKey ? "zoom" : e.shiftKey ? "pan" : "orbit", lx: x, ly: y}; return; }
+  if (e.altKey){ const i = pick(cv, x, y); if (i >= 0){ remember(); sel = i; togglePin(i); draw(); } return; }
+  for (const h of DOWN_HOOKS){
+    const d = h(cv, x, y, e);
+    if (d){ remember(); drag = d; draw(); return; }
+  }
+  if (mode === "persp" && cv === front){
+    if (camHeld()) return;
+    drag = {cam: true, roll: e.shiftKey, x, y, yaw: S.cam.yaw, pitch: S.cam.pitch, roll0: S.cam.roll}; remember(); return; }
+  // a finger: a tap picks a joint and the picked one is dragged; a swipe elsewhere turns the camera
+  if (e.pointerType === "touch"){
+    const i = pick(cv, x, y);
+    if (i >= 0 && i === sel && mode !== "place"){ remember(); drag = {cv, i, single: e.shiftKey}; }
+    else drag = {tapPick: i, cv, x, y};
+    return;
+  }
+  if (mode === "place"){ if (cv === front){ sel = pick(cv, x, y); draw(); } return; }   // select only
+  sel = pick(cv, x, y); draw();
+  if (sel >= 0){ remember(); drag = {cv, i: sel, single: e.shiftKey}; }
+}
+function move(cv, e){
+  if (!drag) return;
+  const [x, y] = evPos(cv, e), W = cv.width, H = cv.height;
+  if (drag.move){ drag.move(x, y, e); drawSoon(); return; }
+  if (drag.nav){
+    const dx = x - drag.lx, dy = y - drag.ly; drag.lx = x; drag.ly = y;
+    if (drag.nav === "orbit") camOrbit(-dx * 240 / W, dy * 180 / H);
+    else if (drag.nav === "pan") camPan(dx, dy, W, H);
+    else camZoom(Math.exp(-dy * 3 / H));
+    camSync(); drawSoon(); return;
+  }
+  if (drag.tapPick !== undefined){
+    if (Math.hypot(x - drag.x, y - drag.y) < 12 * (devicePixelRatio || 1)) return;
+    if (cv === front && !camHeld()){ remember(); drag = {nav: "orbit", lx: drag.x, ly: drag.y}; move(cv, e); } else drag = null;
+    return;
+  }
+  if (drag.cam && drag.roll){
+    S.cam.roll = Math.max(-90, Math.min(90, drag.roll0 + (x - drag.x) * 90 / W));
+    syncUI();
+  } else if (drag.cam){
+    S.cam.yaw = Math.max(-180, Math.min(180, drag.yaw + (x - drag.x) * 180 / W));
+    S.cam.pitch = Math.max(-80, Math.min(80, drag.pitch + (y - drag.y) * 120 / H));
+    syncUI();
+  } else if (cv === side){ if (mode !== "body"){ dragSide(drag.i, x, y, W, H); afterEdit(drag.i); } }
+  else if (mode === "pose"){
+    const i = drag.i, pinnedKid = KIDS[i].some(k => S.pins && S.pins[k]);
+    if (i === IX.pelvis && S.pins && S.pins[i]) { /* pinned: the whole figure does not move */ }
+    else if (pinnedKid && !drag.single && dragMidPinned(i, x, y, W, H)) { /* the hand / foot stays */ }
+    else if (IK_END[J[i]] && !drag.single) dragIK(i, x, y, W, H);
+    else dragPose(i, x, y, W, H);
+    afterEdit(i);
+  }
+  else if (mode === "body") dragBody(drag.i, x, y, W, H);
+  drawSoon();
+}
+function up(){
+  if (drag && drag.tapPick !== undefined && !(mode === "place" && drag.cv === side)){ sel = drag.tapPick; draw(); }
+  if (drag && drag.nav) syncUI();
+  drag = null;
+}
+// ---- the camera without the Perspective mode: turn, move, zoom (the lens stays) -------------
+function zoomSpan(){ return [0.3, 4]; }
+// 「カメラを固定する」: free moves (drags, swipes, pinches, the wheel, the keypad, the pad) are
+// refused with a word; the Perspective sliders and a remembered camera still set it
+function camHeld(){ if (!S.camLock) return false; say("カメラは固定中です（「カメラの固定と記憶」で外せます）。", true); return true; }
+function camWrap(a){ return ((a + 180) % 360 + 360) % 360 - 180; }
+function camOrbit(dyaw, dpitch){
+  S.cam.yaw = camWrap(S.cam.yaw + dyaw);
+  S.cam.pitch = Math.max(-80, Math.min(80, S.cam.pitch + dpitch));
+}
+function camPan(dx, dy, W, H){                // the picture follows the pointer (pixels of a W x H view)
+  const s = lensF(W, H) / camDist(W, H);
+  S.center = add(S.center, camRotInv([-dx / s, dy / s, 0]));
+}
+function camZoom(k){ const [a, b] = zoomSpan(); S.cam.zoom = Math.max(a, Math.min(b, S.cam.zoom * k)); }
+// while dragging: only the camera's own sliders (the full syncUI runs when the drag ends)
+function camSync(){
+  for (const id of ["yaw", "pitch", "roll"]){ const v = Math.round(S.cam[id]); $(id).value = v;
+    if (document.activeElement !== $(id + "V")) $(id + "V").value = v; }
+}
+// the camera as coordinates (cm): where it is and the point it looks at (S.center). Its distance
+// is camDist(), so the place sets the zoom too; pitch and zoom keep to their ranges.
+const CAM_P = ["camPX", "camPY", "camPZ"], CAM_T = ["camTX", "camTY", "camTZ"];
+function camDist1(){ const [W, H] = exportSize(); return camDist(W, H) * S.cam.zoom; }   // at zoom 1
+function camPos(){
+  const p = deg(S.cam.pitch), y = deg(S.cam.yaw), D = camDist1() / S.cam.zoom;
+  return add(S.center, mul([Math.cos(p) * Math.sin(y), Math.sin(p), Math.cos(p) * Math.cos(y)], D));
+}
+function setCamPos(pos){
+  const d = sub(pos, S.center), L = len(d); if (L < 1) return false;
+  const [a, b] = zoomSpan();
+  S.cam.pitch = Math.max(-80, Math.min(80, Math.asin(d[1] / L) * 180 / Math.PI));
+  if (Math.hypot(d[0], d[2]) > 1e-6) S.cam.yaw = Math.atan2(d[0], d[2]) * 180 / Math.PI;
+  S.cam.zoom = Math.max(a, Math.min(b, camDist1() / L));
+  return true;
+}
+function camCoords(){
+  const show = (ids, v) => ids.forEach((id, k) => { const el = $(id); if (el && document.activeElement !== el) el.value = Math.round(v[k]); });
+  show(CAM_P, camPos()); show(CAM_T, S.center);
+}
+function camLockUI(){
+  const on = !!S.camLock;
+  for (const id of ["lens", "yaw", "pitch", "roll"]) { $(id).disabled = on; $(id + "V").disabled = on; }
+  for (const id of [...CAM_P, ...CAM_T, "camReset"]) $(id).disabled = on;
+}
+function zoomThumb(){
+  const z = document.getElementById("zoomer"); if (!z) return;
+  const [a, b] = zoomSpan(), k = 1 - Math.log(S.cam.zoom / a) / Math.log(b / a);
+  z.firstElementChild.style.top = `calc(3px + (100% - 26px) * ${Math.max(0, Math.min(1, k)).toFixed(3)})`;
+}
+// flip the bone toward / away from the camera (double-click, double-tap)
+function flipAt(x, y){
+  if (mode !== "pose") return;
+  const i = pick(front, x, y);
+  if (i <= 0) return;
+  remember();
+  const par = PARENT[i], pc = toCam(S.P[par]), ic = toCam(S.P[i]);
+  const flipped = [ic[0], ic[1], pc[2] - (ic[2] - pc[2])];
+  rotateSubtree(i, add(camRotInv(flipped), S.center)); afterEdit(i); draw();
+}
+// the wheel, a trackpad, two fingers: one "step" each (in or out)
+// a run of wheel notches (or pinch steps) on the camera is one undo step
+let wheelMem = 0;
+function wheelStep(x, y, step, e){
+  if (WHEEL_HOOKS.some(h => h(x, y, step, e))){ draw(); return; }
+  if (mode !== "body" && !S.camLock){ const t = performance.now(); if (t - wheelMem > 800) remember(); wheelMem = t; }
+  if (mode === "persp"){ if (camHeld()) return; S.cam.lens = Math.max(14, Math.min(200, S.cam.lens * (step > 0 ? 1.1 : 1/1.1))); syncUI(); }
+  else if (mode === "body"){ const i = pick(front, x, y);
+    if (i >= 0){ remember(); const k = step > 0 ? 1.08 : 1/1.08; S.R[i] *= k;
+      if ($("sym").checked && MIRROR[i] !== i) S.R[MIRROR[i]] *= k; } }
+  else { if (camHeld()) return; S.cam.zoom = Math.max(0.3, Math.min(4, S.cam.zoom * (step > 0 ? 1.1 : 1/1.1))); }
+  draw();
+}
+// pointers on a canvas: one drags; a second finger turns it into a pinch (no drag)
+const touches = new Map();
+let pinch = null, tap = null;
+for (const cv of [front, side]){
+  cv.addEventListener("pointerdown", e => {
+    lastPointer = e.pointerType || "mouse";
+    // the on-screen keys appear after this touch (showing them now would move the view under the finger)
+    if (e.pointerType === "touch" && !document.body.classList.contains("touch"))
+      setTimeout(() => { document.body.classList.add("touch"); draw(); }, 0);
+    if (e.button === 1) e.preventDefault();                              // the middle button: the camera, not autoscroll
+    try { cv.setPointerCapture(e.pointerId); } catch (err) {}
+    if (e.pointerType === "touch"){
+      touches.set(e.pointerId, evPos(cv, e));
+      if (touches.size === 2 && cv === front){                          // a pinch: forget the drag
+        drag = null; tap = null;
+        const [a, b] = [...touches.values()];
+        // pose and body modes: the camera zooms and moves; the others keep their wheel (lens, objects)
+        pinch = {d: Math.hypot(a[0] - b[0], a[1] - b[1]) || 1, m: [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2],
+                 cam: mode === "pose" || mode === "body", held: mode !== "place" && camHeld()};
+        if (pinch.cam && !pinch.held) remember();
+        return;
+      }
+      if (touches.size > 2 || pinch) return;
+    }
+    tap = {cv, x: e.clientX, y: e.clientY, t: performance.now(), type: e.pointerType};
+    down(cv, evMods(e));
+  });
+  cv.addEventListener("pointermove", e => {
+    if (e.pointerType === "touch" && touches.has(e.pointerId)) touches.set(e.pointerId, evPos(cv, e));
+    if (pinch && touches.size >= 2){
+      const [a, b] = [...touches.values()], d = Math.hypot(a[0] - b[0], a[1] - b[1]) || 1;
+      if (pinch.held) return;
+      if (pinch.cam){ const m = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
+        camZoom(d / pinch.d); camPan(m[0] - pinch.m[0], m[1] - pinch.m[1], front.width, front.height);
+        pinch.d = d; pinch.m = m; camSync(); drawSoon(); return; }
+      const r = d / pinch.d;
+      if (r > 1.12 || r < 1 / 1.12){ wheelStep((a[0] + b[0]) / 2, (a[1] + b[1]) / 2, r > 1 ? 1 : -1, evMods(e)); pinch.d = d; }
+      return;
+    }
+    if (tap && Math.hypot(e.clientX - tap.x, e.clientY - tap.y) > 10) tap = null;
+    move(cv, evMods(e));
+  });
+  const end = e => {
+    touches.delete(e.pointerId);
+    if (pinch){ if (touches.size === 0){ if (pinch.cam) syncUI(); pinch = null; } return; }
+    up();
+    // a double tap (finger or pen) flips the bone, as a double-click does
+    if (e.type === "pointerup" && tap && tap.cv === front && tap.type !== "mouse" && performance.now() - tap.t < 300){
+      const now = {x: e.clientX, y: e.clientY, t: performance.now()};
+      if (lastTap && now.t - lastTap.t < 400 && Math.hypot(now.x - lastTap.x, now.y - lastTap.y) < 30){
+        const [x, y] = evPos(front, e); lastTap = null; flipAt(x, y);
+      } else lastTap = now;
+    }
+    tap = null;
+  };
+  cv.addEventListener("pointerup", end); cv.addEventListener("pointercancel", end);
+  cv.addEventListener("contextmenu", e => e.preventDefault());           // right button, pen button, long press
+}
+let lastTap = null;
+front.addEventListener("dblclick", e => { if (lastPointer === "mouse"){ const [x, y] = evPos(front, e); flipAt(x, y); } });
+// the wheel: a mouse notch is one step; small trackpad deltas add up first
+let wheelAcc = 0;
+front.addEventListener("wheel", e => {
+  e.preventDefault();
+  const dy = e.deltaMode === 1 ? e.deltaY * 33 : e.deltaMode === 2 ? e.deltaY * 600 : e.deltaY;
+  const [x, y] = evPos(front, e);
+  if (Math.abs(dy) >= 40){ wheelAcc = 0; wheelStep(x, y, dy < 0 ? 1 : -1, evMods(e)); return; }
+  wheelAcc += dy;
+  if (Math.abs(wheelAcc) >= 40){ const step = wheelAcc < 0 ? 1 : -1; wheelAcc = 0; wheelStep(x, y, step, evMods(e)); }
+}, {passive: false});
+// Safari's trackpad pinch (gesture events) zooms the view, not the page
+{ let g = 1;
+  front.addEventListener("gesturestart", e => { e.preventDefault(); g = 1; });
+  front.addEventListener("gesturechange", e => { e.preventDefault();
+    const r = e.scale / g; if (r > 1.12 || r < 1 / 1.12){ g = e.scale;
+      const [x, y] = evPos(front, e); wheelStep(x, y, r > 1 ? 1 : -1, evMods(e)); } });
+}
+// Ctrl+Z undoes; Ctrl+Y or Ctrl+Shift+Z redoes (⌘ on a Mac). Typing in a field, they undo the typing.
+document.addEventListener("keydown", e => {
+  if (!(e.ctrlKey || e.metaKey)) return;
+  if (e.target && e.target.matches && e.target.matches("textarea, input:not([type=range]):not([type=checkbox]):not([type=color])")) return;
+  const k = e.key.toLowerCase();
+  if (k === "z" && !e.shiftKey){ e.preventDefault(); undo(); }
+  else if (k === "y" || (k === "z" && e.shiftKey)){ e.preventDefault(); redo(); }
+});
+// the numeric keypad as in Blender: 1 front, 3 from the figure's right, 7 from above (Ctrl: the
+// other side), 2 4 6 8 turn by 15° (Ctrl: move), 9 round to the back, + - zoom, . the selected
+// joint to the middle; Home: the figure to the middle
+document.addEventListener("keydown", e => {
+  if (e.target && e.target.closest && e.target.closest("input, select, textarea")) return;
+  const c = S.cam, ctl = e.ctrlKey || e.metaKey, W = front.width, H = front.height, step = H * 0.1;
+  const act = {
+    Numpad1: () => Object.assign(c, {yaw: ctl ? 180 : 0, pitch: 0, roll: 0}),
+    Numpad3: () => Object.assign(c, {yaw: ctl ? 90 : -90, pitch: 0, roll: 0}),
+    Numpad7: () => Object.assign(c, {yaw: 0, pitch: ctl ? -80 : 80, roll: 0}),
+    Numpad9: () => { c.yaw = camWrap(c.yaw + 180); },
+    Numpad4: () => ctl ? camPan(step, 0, W, H) : camOrbit(15, 0),
+    Numpad6: () => ctl ? camPan(-step, 0, W, H) : camOrbit(-15, 0),
+    Numpad8: () => ctl ? camPan(0, step, W, H) : camOrbit(0, 15),
+    Numpad2: () => ctl ? camPan(0, -step, W, H) : camOrbit(0, -15),
+    NumpadAdd: () => camZoom(1.15), NumpadSubtract: () => camZoom(1 / 1.15),
+    NumpadDecimal: () => { if (sel >= 0) S.center = S.P[sel].slice(); },
+    Home: () => { const p = S.P[IX.pelvis]; S.center = [p[0], p[1] - 5, p[2]]; c.zoom = 1; },
+  }[e.code];
+  if (!act) return;
+  e.preventDefault(); if (camHeld()) return;
+  remember(); act(); syncUI(); draw();
+});
+
+// ---- body mode sliders: whole-body scale, head, thickness (relative to the slider's last value,
+// kept in S.scale so undo and each figure bring their sliders back)
+function scaleAbout(k){
+  const c = S.P[IX.pelvis]; S.P = S.P.map(p => add(c, mul(sub(p, c), k))); S.R = S.R.map(r => r * k);
+}
+function scaleHead(k){
+  const n = S.P[IX.neck], v = sub(S.P[IX.head], n);
+  S.P[IX.head] = add(n, mul(v, k)); S.R[IX.head] *= k;
+}
+
+// ---- body by sex: bone lengths (cm, from the parent) and widths; the pose's directions kept
+const SEX_BODY = {
+  female: {height: 158, head: 10.8, waistR: 11, hipR: 7,
+           len: {waist: 13, chest: 18, neck: 13, head: 11, r_shoulder: 17.5, r_elbow: 26, r_wrist: 22,
+                 r_hip: 10.5, r_knee: 41, r_ankle: 39, r_toe: 13}},
+  male:   {height: 171, head: 11.25, waistR: 13.5, hipR: 6,
+           len: {waist: 14, chest: 20, neck: 14, head: 11.5, r_shoulder: 21, r_elbow: 29, r_wrist: 25,
+                 r_hip: 9.5, r_knee: 45, r_ankle: 42, r_toe: 14.5}},
+};
+function setLengths(lengths){                 // keep every bone's direction, change its length
+  const old = S.P.map(p => p.slice()), out = S.P.map(p => p.slice());
+  for (const i of subtree(0).slice(1)){
+    const p = PARENT[i], name = J[i].startsWith("l_") ? "r_" + J[i].slice(2) : J[i];
+    const L = name in lengths ? lengths[name] : len(sub(old[i], old[p]));
+    out[i] = add(out[p], mul(norm(sub(old[i], old[p])), L));
+  }
+  S.P = out;
+}
+function applySex(sex){
+  const b = SEX_BODY[sex];
+  setLengths(b.len);
+  S.R[IX.head] = b.head; S.R[IX.waist] = b.waistR; S.R[IX.r_hip] = S.R[IX.l_hip] = b.hipR;
+  scaleAbout(b.height / standingHeight());
+}
+// The body's own frame: the whole figure's turn (S.body), so a bone's angles stay the same
+// when the whole figure is turned. Bone angles are measured from the bone's rest direction:
+// 前後 toward the figure's front, 左右 outward (for the middle of the body: toward its left).
+function bodyRot(v, inv){
+  const b = S.body, steps = [[[0, 0, 1], b.roll], [[1, 0, 0], b.pitch], [[0, 1, 0], b.yaw]];
+  if (inv){ steps.reverse(); for (const st of steps) v = rotAxis(v, st[0], -deg(st[1])); return v; }
+  for (const st of steps) v = rotAxis(v, st[0], deg(st[1]));
+  return v;
+}
+function restFrame(i){
+  const e1 = norm(sub(REST[i], REST[PARENT[i]]));
+  const ref = Math.abs(e1[2]) < 0.9 ? [0, 0, 1] : [0, 1, 0];
+  const ef = norm(sub(ref, mul(e1, dot(ref, e1))));
+  let es = cross(e1, ef);
+  if (J[i].startsWith("l_")) es = mul(es, -1);       // + = outward on both sides
+  return [e1, ef, es];
+}
+function boneAngles(i){
+  const v = norm(bodyRot(sub(S.P[i], S.P[PARENT[i]]), true));
+  const [e1, ef, es] = restFrame(i), a = dot(v, e1), b = dot(v, ef), c = dot(v, es);
+  return {fwd: Math.atan2(b, a) * 180 / Math.PI,
+          side: Math.atan2(c, Math.hypot(a, b)) * 180 / Math.PI};
+}
+function setBoneAngles(i, fwd, side){
+  const [e1, ef, es] = restFrame(i), L = len(sub(S.P[i], S.P[PARENT[i]]));
+  const f = deg(fwd), sd = deg(side);
+  const vb = add(mul(add(mul(e1, Math.cos(f)), mul(ef, Math.sin(f))), Math.cos(sd)), mul(es, Math.sin(sd)));
+  rotateSubtree(i, add(S.P[PARENT[i]], mul(bodyRot(vb), L)));
+}
+function setTwist(i, v){
+  v = clampTwist(i, v);
+  const p = PARENT[i], axis = sub(S.P[i], S.P[p]), d = deg(v - (S.twist[i] || 0));
+  for (const k of subtree(i)) S.P[k] = add(S.P[p], rotAxis(sub(S.P[k], S.P[p]), axis, d));
+  S.twist[i] = v;
+}
+// ---- left-right symmetry: the other side takes a joint's pose, mirrored in the body's frame
+// (so both sides then read the same 前後 / 左右 / ねじり); each side keeps its own bone lengths
+function mirroredBone(k){
+  const m = MIRROR[k], v = bodyRot(sub(S.P[k], S.P[PARENT[k]]), true);
+  return mul(norm(bodyRot([-v[0], v[1], v[2]])), len(sub(S.P[m], S.P[PARENT[m]])));
+}
+// whole: the joint and everything after it; else this bone only (what hangs on it follows)
+function symmetrize(i, whole){
+  const m = MIRROR[i]; if (m === i) return [];
+  const moved = subtree(m);
+  if (whole){
+    for (const k of subtree(i)){ const o = MIRROR[k];
+      const d = add(S.P[PARENT[o]], mirroredBone(k)), shift = sub(d, S.P[o]);
+      S.P[o] = d; for (const q of subtree(o).slice(1)) S.P[q] = add(S.P[q], shift);
+      S.twist[o] = -(S.twist[k] || 0); }
+    const side = J[i][0], other = J[m][0];
+    if (subtree(i).some(k => /_wrist$/.test(J[k]))) S.hands[other] = S.hands[side];
+  } else if (HAND_J.has(i)){
+    setTwist(twistJoint(m), -(S.twist[twistJoint(i)] || 0));
+    rotateSubtree(m, add(S.P[PARENT[m]], mirroredBone(i)));
+  } else {
+    rotateSubtree(m, add(S.P[PARENT[m]], mirroredBone(i)));
+    setTwist(m, -(S.twist[i] || 0));
+  }
+  // a pinned joint on the other side stays where the copy put it
+  for (const k of moved) if (S.pins && S.pins[k]) S.pins[k] = S.P[k].slice();
+  return moved;
+}
+function symmetrizeLimbs(from){
+  remember();
+  for (const n of ["shoulder", "hip"]) symmetrize(IX[`${from}_${n}`], true);
+  afterEdit(); draw();
+  say(from === "r" ? "右の手足を左へ写しました。" : "左の手足を右へ写しました。");
+}
+// the whole figure turned about a world axis (the 3軸ハンドル's rings on the hips): S.body takes the
+// turn, as yaw / pitch / roll in bodyRot's order (M = Ry(yaw) Rx(pitch) Rz(roll)); the joints are turned by the caller
+function turnBody(axis, ang){
+  const f = v => rotAxis(bodyRot(v), axis, ang), ex = f([1, 0, 0]), ey = f([0, 1, 0]), ez = f([0, 0, 1]);
+  const pitch = Math.asin(Math.max(-1, Math.min(1, -ez[1]))), r2d = 180 / Math.PI;
+  let yaw, roll;
+  if (Math.cos(pitch) < 1e-6){ yaw = Math.atan2(-ex[2], ex[0]); roll = 0; }      // straight up or down
+  else { yaw = Math.atan2(ez[0], ez[2]); roll = Math.atan2(ex[1], ey[1]); }
+  S.body = Object.assign({}, S.body, {yaw: yaw * r2d, pitch: pitch * r2d, roll: roll * r2d});
+}
+function setBodyTurn(key, v){
+  const c = S.P[IX.pelvis], old = S.P.map(q => bodyRot(sub(q, c), true));
+  S.body[key] = v;
+  S.P = old.map(q => add(c, bodyRot(q)));
+}
+// [id, label, min, max, step, unit, kind: bone | any | root]
+const JOINT_CTL = [
+  ["jFwd", "前後（＋前へ）", -180, 180, 1, "°", "bone"],
+  ["jSide", "左右（＋外へ、胴・首・頭は人物の左へ）", -90, 90, 1, "°", "bone"],
+  ["jTwist", "ねじり（骨を軸に先を回す）", -180, 180, 1, "°", "bone"],
+  ["jLen", "骨の長さ", 1, 120, 0.5, "cm", "bone"],
+  ["jRad", "丸の大きさ（半径）", 0.5, 40, 0.5, "cm", "any"],
+  ["pX", "位置：左右（＋人物の左）", -300, 300, 1, "cm", "root"],
+  ["pY", "位置：上下", -100, 300, 1, "cm", "root"],
+  ["pZ", "位置：前後（＋前）", -300, 300, 1, "cm", "root"],
+  ["bYaw", "体の向き", -180, 180, 1, "°", "root"],
+  ["bPitch", "体の前後の傾き（＋前へ）", -90, 90, 1, "°", "root"],
+  ["bRoll", "体の左右の傾き", -90, 90, 1, "°", "root"],
+];
+// what the three angles mean at each joint (all joints turn about three axes: 前後, 左右, ねじり)
+const AXIS_NAMES = {
+  head: ["うなずく（＋下を向く）", "首をかしげる（＋人物の左へ）", "左右を向く（＋人物の左を向く）"],
+  neck: ["首の前後（＋前へ）", "首の左右の傾き", "首のひねり（顔も回る）"],
+  chest: ["胸の前屈・後屈（＋前へ）", "胸の横への傾き", "胸のひねり"],
+  waist: ["腰の前屈・後屈（＋前へ）", "腰の横への傾き", "腰のひねり"],
+  r_shoulder: ["肩を前へ・後ろへ", "肩をすくめる・下げる", "肩のひねり"],
+  r_elbow: ["腕を前・上へ上げる（＋前へ）", "腕を横へ上げる（＋外へ）", "腕のひねり（内・外へ回す）"],
+  r_wrist: ["肘の曲げ（前腕の前後）", "前腕の左右", "前腕のひねり（手のひらの向き）"],
+  r_hip: ["股の位置（前後）", "股の位置（左右）", "骨盤のひねり"],
+  r_knee: ["脚を前・後ろへ（＋前へ）", "脚を横へ開く（＋外へ）", "脚のひねり（つま先の向き）"],
+  r_ankle: ["膝の曲げ（すねの前後）", "すねの左右", "すねのひねり"],
+  r_toe: ["足首の上下（つま先）", "足首の左右", "足のひねり"],
+  r_hand: ["手首の曲げ（＋前へ）", "手首の左右（＋外へ）", "手のひらの向き（前腕のひねり）"],
+};
+function axisNames(i){
+  const n = J[i].startsWith("l_") ? "r_" + J[i].slice(2) : J[i];
+  return AXIS_NAMES[n] || ["前後（＋前へ）", "左右（＋外へ）", "ねじり（骨を軸に先を回す）"];
+}
+// the hand's twist is the forearm's (the palm turns with the forearm): kept on the wrist joint
+const twistJoint = i => HAND_J.has(i) ? IX[J[i][0] + "_wrist"] : i;
+function jointValue(id){
+  const i = sel;
+  if (id === "jFwd") return boneAngles(i).fwd;
+  if (id === "jSide") return boneAngles(i).side;
+  if (id === "jTwist") return S.twist[twistJoint(i)] || 0;
+  if (id === "jLen") return len(sub(S.P[i], S.P[PARENT[i]]));
+  if (id === "jRad") return S.R[i];
+  if (id === "pX") return S.P[IX.pelvis][0];
+  if (id === "pY") return S.P[IX.pelvis][1];
+  if (id === "pZ") return S.P[IX.pelvis][2];
+  return S.body[{bYaw: "yaw", bPitch: "pitch", bRoll: "roll"}[id]];
+}
+function setJointValue(id, v){
+  const i = sel, sym = $("sym").checked && MIRROR[i] !== i;
+  const both = fn => { fn(i); if (sym) fn(MIRROR[i]); };
+  if (id === "jFwd" || id === "jSide"){
+    const a = boneAngles(i), fwd = id === "jFwd" ? v : a.fwd, side = id === "jSide" ? v : a.side;
+    setBoneAngles(i, fwd, side);
+  } else if (id === "jTwist") setTwist(twistJoint(i), v);
+  else if (id === "jLen") both(j => { const d = sub(S.P[j], S.P[PARENT[j]]); moveSubtree(j, mul(norm(d), v - len(d))); });
+  else if (id === "jRad") both(j => { S.R[j] = v; });
+  else if (id[0] === "p"){ const k = {pX: 0, pY: 1, pZ: 2}[id], d = [0, 0, 0];
+    d[k] = v - S.P[IX.pelvis][k]; S.P = S.P.map(q => add(q, d)); }
+  else setBodyTurn({bYaw: "yaw", bPitch: "pitch", bRoll: "roll"}[id], v);
+}
+// ---- human joint limits (degrees) ---------------------------------------------------------------
+// Ball joints: the bone's 前後 / 左右 in the body's frame (see boneAngles). Hinges (elbow, knee):
+// the bend from the upper bone, one way only. Ankle: the angle between the shin and the foot.
+const BALL = {
+  waist: {fwd: [-30, 45], side: [-30, 30]},       // the lower back: bend forward / back, sideways
+  chest: {fwd: [-25, 40], side: [-25, 25]},
+  neck: {fwd: [-15, 25], side: [-15, 15]},
+  head: {fwd: [-60, 70], side: [-45, 45]},
+  r_shoulder: {fwd: [-20, 20], side: [-15, 30]},  // the shoulder girdle: shrug, forward / back
+  r_elbow: {fwd: [-70, 180], side: [-40, 90]},    // the upper arm at the shoulder
+  r_hip: {fwd: [-10, 10], side: [-10, 10]},       // the pelvis' own width: barely moves
+  r_knee: {fwd: [-40, 125], side: [-30, 50]},     // the thigh at the hip
+  r_hand: {fwd: [-85, 85], side: [-35, 40]},      // the wrist: bent toward the palm / the back, sideways
+};
+const HINGE = {r_wrist: {max: 150, way: 1, tol: 0.35}, r_ankle: {max: 150, way: -1, tol: 0.2}};   // elbow: not far backward; knee: not forward
+const FOOT = {r_toe: [70, 140]};                   // angle between the shin and the foot
+const TWIST = {r_elbow: 90, r_wrist: 80, r_knee: 45, r_ankle: 30, waist: 40, chest: 40, neck: 50, head: 80, r_hand: 20};
+const limitsOn = () => $("limits").checked;
+const sideName = n => n.startsWith("l_") ? "r_" + n.slice(2) : n;
+const clampV = (v, [a, b]) => Math.max(a, Math.min(b, v));
+function bodyFront(){ return bodyRot([0, 0, 1]); }
+function enforceLimits(){
+  if (!limitsOn()) return;
+  for (const i of subtree(0).slice(1)){
+    const name = sideName(J[i]), p = PARENT[i];
+    if (BALL[name]){
+      // measured from the parent bone (the chest leaning back does not count as the neck's
+      // bend): the parent's swing from standing is taken out first
+      const lim = BALL[name], pp = PARENT[p];
+      let v = bodyRot(sub(S.P[i], S.P[p]), true);
+      const L = len(v);
+      let pc = null, pr = null;
+      if (pp >= 0){ pc = bodyRot(sub(S.P[p], S.P[pp]), true); pr = sub(REST[p], REST[pp]); v = rotBetween(v, pc, pr); }
+      const [e1, ef, es] = restFrame(i), d = norm(v);
+      const a = dot(d, e1), b = dot(d, ef), c = dot(d, es);
+      const fwd = Math.atan2(b, a) * 180 / Math.PI, side = Math.atan2(c, Math.hypot(a, b)) * 180 / Math.PI;
+      const f = clampV(fwd, lim.fwd), sd = clampV(side, lim.side);
+      if (Math.abs(f - fwd) > 1e-6 || Math.abs(sd - side) > 1e-6){
+        const fr = deg(f), sr = deg(sd);
+        let vb = add(mul(add(mul(e1, Math.cos(fr)), mul(ef, Math.sin(fr))), Math.cos(sr)), mul(es, Math.sin(sr)));
+        if (pp >= 0) vb = rotBetween(vb, pr, pc);
+        rotateSubtree(i, add(S.P[p], mul(bodyRot(norm(vb)), L)));
+      }
+    } else if (HINGE[name]){
+      // the bend is at most `max` degrees, and not the wrong way: an elbow does not fold
+      // backward, a knee not forward. Sideways is allowed (the upper bone's own twist, which
+      // the figure does not track, decides that: a hand on the hip bends the elbow inward).
+      const g = PARENT[p], up = norm(sub(S.P[p], S.P[g])), v = sub(S.P[i], S.P[p]), L = len(v);
+      // the upper bone's own front: the body's front, turned the way the upper bone turned
+      // from standing (a thigh raised forward has its front facing up)
+      const upRest = bodyRot(norm(sub(REST[p], REST[g])));
+      let front = rotBetween(bodyFront(), upRest, up);
+      front = sub(front, mul(up, dot(front, up)));
+      if (len(front) < 1e-3) front = sub(bodyRot([0, 1, 0]), mul(up, dot(bodyRot([0, 1, 0]), up)));
+      front = mul(norm(front), HINGE[name].way);
+      const d = norm(v), along = dot(d, up);
+      let w = sub(d, mul(up, along));
+      const wl = len(w);
+      let bend = Math.atan2(wl, along) * 180 / Math.PI;
+      let dir = wl > 1e-6 ? mul(w, 1 / wl) : front;
+      const tol = HINGE[name].tol;
+      if (dot(dir, front) < -tol && bend > 5){
+        // turn the bend's direction back to the edge of what is allowed
+        const side = norm(sub(dir, mul(front, dot(dir, front))));
+        const c = -tol, sn = Math.sqrt(1 - c * c);
+        dir = len(side) > 1e-6 ? add(mul(front, c), mul(side, sn)) : front;
+      }
+      bend = Math.max(0, Math.min(HINGE[name].max, bend));
+      const nd = add(mul(up, Math.cos(deg(bend))), mul(dir, Math.sin(deg(bend))));
+      if (len(sub(nd, d)) > 1e-4) rotateSubtree(i, add(S.P[p], mul(nd, L)));
+    } else if (FOOT[name]){
+      const shin = norm(sub(S.P[p], S.P[PARENT[p]])), v = sub(S.P[i], S.P[p]), L = len(v), d = norm(v);
+      const ang = Math.acos(Math.max(-1, Math.min(1, dot(mul(shin, -1), d)))) * 180 / Math.PI;
+      const want = clampV(ang, FOOT[name]);
+      if (Math.abs(want - ang) > 1e-3){
+        let axis = cross(mul(shin, -1), d); if (len(axis) < 1e-6) axis = cross(shin, bodyFront());
+        const nd = rotAxis(mul(shin, -1), axis, deg(want));
+        rotateSubtree(i, add(S.P[p], mul(norm(nd), L)));
+      }
+    }
+  }
+}
+// pins: a pinned wrist / ankle stays where it was pinned (two-bone IK from the shoulder / hip);
+// a pinned elbow / knee keeps the upper bone's end; the pinned pelvis does not move
+function solveIK(i, target){
+  const mid = PARENT[i], root = PARENT[mid];
+  const r = S.P[root], m = S.P[mid], e = S.P[i];
+  const L1 = len(sub(m, r)), L2 = len(sub(e, m));
+  let c = len(sub(target, r));
+  c = Math.max(Math.abs(L1 - L2) + 1e-3, Math.min(L1 + L2 - 1e-3, c));
+  const dT = norm(sub(target, r));
+  let pole = sub(sub(m, r), mul(dT, dot(sub(m, r), dT)));
+  if (len(pole) < 0.15 * L1){
+    pole = mul(bodyFront(), J[i].endsWith("ankle") ? 1 : -1);
+    pole = sub(pole, mul(dT, dot(pole, dT)));
+    if (len(pole) < 1e-6) pole = cross(dT, [0, 0, 1]);
+  }
+  const pn = norm(pole);
+  const cosA = Math.max(-1, Math.min(1, (L1*L1 + c*c - L2*L2) / (2 * L1 * c)));
+  rotateSubtree(mid, add(r, add(mul(dT, L1 * cosA), mul(pn, L1 * Math.sqrt(1 - cosA*cosA)))));
+  rotateSubtree(i, add(r, mul(dT, c)));
+}
+const PINNABLE = new Set(["pelvis", "r_wrist", "l_wrist", "r_ankle", "l_ankle", "r_elbow", "l_elbow", "r_knee", "l_knee"]);
+function holdPins(except){
+  for (const [k, pos] of Object.entries(S.pins || {})){
+    const i = +k; if (i === except) continue;
+    if (len(sub(S.P[i], pos)) < 1e-3) continue;
+    if (i === IX.pelvis){ const d = sub(pos, S.P[i]); S.P = S.P.map(q => add(q, d)); continue; }
+    if (IK_END[J[i]]) solveIK(i, pos);
+    else rotateSubtree(i, add(S.P[PARENT[i]], mul(norm(sub(pos, S.P[PARENT[i]])), len(sub(S.P[i], S.P[PARENT[i]])))));
+  }
+}
+// a joint of an arm or leg -> the first joint of that limb (shoulder / hip)
+function limbRoot(i){ while (PARENT[i] >= 0 && MIRROR[PARENT[i]] !== PARENT[i]) i = PARENT[i]; return i; }
+function afterEdit(moved){
+  enforceLimits();
+  // 左右同時に動かす: the other arm or leg follows (pose mode; the body mode has its own 左右対称)
+  const sp = document.getElementById("symPose");
+  if (sp && sp.checked && mode === "pose" && moved >= 0 && MIRROR[moved] !== moved) symmetrize(limbRoot(moved), true);
+  if (typeof sceneAfterEdit === "function") sceneAfterEdit(moved);
+  holdPins(moved);
+  if (moved !== undefined && S.pins && S.pins[moved]) S.pins[moved] = S.P[moved].slice();
+}
+function togglePin(i){
+  if (!PINNABLE.has(J[i])) { say("固定できるのは腰・肘・手首・膝・足首です。", true); return; }
+  S.pins = S.pins || {};
+  // 左右同時に動かす moves the other limb after a pin is held, so the two are not on together
+  if (!S.pins[i] && $("symPose").checked){ say("「左右同時に動かす」がオンの間は固定できません。", true); return; }
+  if (S.pins[i]) delete S.pins[i]; else S.pins[i] = S.P[i].slice();
+  say(S.pins[i] ? `${J_JA[J[i]]}を固定しました。` : `${J_JA[J[i]]}の固定を外しました。`);
+}
+// dragging an elbow / knee whose hand / foot is pinned: the joint slides on the circle where
+// both bones still reach (the hand / foot stays)
+function dragMidPinned(i, x, y, W, H){
+  const end = KIDS[i].find(k => S.pins && S.pins[k]), root = PARENT[i];
+  const r = S.P[root], e = S.pins[end], L1 = len(sub(S.P[i], r)), L2 = len(sub(S.P[end], S.P[i]));
+  const d = len(sub(e, r)); if (d < 1e-3 || d > L1 + L2) return false;
+  const u = norm(sub(e, r)), a = (L1*L1 - L2*L2 + d*d) / (2*d), h = Math.sqrt(Math.max(0, L1*L1 - a*a));
+  const c = add(r, mul(u, a));
+  const f = lensF(W, H), D = camDist(W, H), mc = toCam(S.P[i]);
+  const dir = norm([(x - W/2) / f, -(y - H/2) / f, -1]), t = (mc[2] - D) / dir[2];
+  const T = add(camRotInv(add([0, 0, D], mul(dir, t))), S.center);
+  let v = sub(T, c); v = sub(v, mul(u, dot(v, u)));
+  if (len(v) < 1e-6) return false;
+  rotateSubtree(i, add(c, mul(norm(v), h)));
+  rotateSubtree(end, e);
+  return true;
+}
+
+function clampTwist(i, v){
+  const t = TWIST[sideName(J[i])];
+  return limitsOn() && t ? Math.max(-t, Math.min(t, v)) : v;
+}
+
+function buildJointPanel(){
+  $("jointCtl").innerHTML = JOINT_CTL.map(([id, label, mn, mx, st, unit, kind]) => `
+    <div data-kind="${kind}" id="${id}Row"><label>${label}</label>
+      <div class="row"><input type="range" id="${id}" min="${mn}" max="${mx}" step="${st}">
+        <input type="number" class="num" id="${id}N" step="${st}"><span class="unit">${unit}</span></div></div>`).join("");
+  for (const [id] of JOINT_CTL){
+    const r = $(id), n = $(id + "N");
+    r.addEventListener("pointerdown", remember);
+    r.addEventListener("input", () => { if (sel < 0) return; setJointValue(id, +r.value); afterEdit(sel); draw(); });
+    n.addEventListener("change", () => { const v = +n.value; if (sel < 0 || !isFinite(v)) return;
+      remember(); setJointValue(id, v); afterEdit(sel); draw(); });
+  }
+}
+function showSelected(){
+  const ok = sel >= 0, root = sel === IX.pelvis;
+  $("selName").textContent = ok ? J_JA[J[sel]] : "（丸をクリック）";
+  // the three axes named for this joint
+  if (ok && !root){ const nm = axisNames(sel);
+    [["jFwd", 0], ["jSide", 1], ["jTwist", 2]].forEach(([id, k]) => { $(id + "Row").querySelector("label").textContent = nm[k]; }); }
+  // pin and hand shape
+  $("pinRow").style.display = ok && PINNABLE.has(J[sel]) ? "" : "none";
+  $("pin").checked = !!(ok && S.pins && S.pins[sel]);
+  $("symRow").style.display = ok && MIRROR[sel] !== sel ? "" : "none";
+  const arm = ok && /_hand$/.test(J[sel]) ? J[sel][0] : null;     // the hand's shape: on the hand joint
+  $("handRow").style.display = arm ? "" : "none";
+  if (arm){ $("handRow").querySelector("label").textContent = (arm === "r" ? "右手" : "左手") + "の形";
+    if (document.activeElement !== $("handSel")) $("handSel").value = S.hands[arm]; }
+  const np = Object.keys(S.pins || {}).length;
+  $("pinInfo").textContent = np ? `固定中の関節：${Object.keys(S.pins).map(k => J_JA[J[+k]]).join("・")}` : "";
+  // either 左右同時に動かす or pins: the one that is off cannot be switched on (what is on can be switched off)
+  const symOn = $("symPose").checked;
+  $("symPose").disabled = !symOn && np > 0;
+  $("pin").disabled = symOn && !$("pin").checked;
+  $("symPinNote").style.display = $("symPose").disabled || $("pin").disabled ? "" : "none";
+  $("symPinNote").textContent = symOn ? "「左右同時に動かす」がオンの間は関節を固定できません。"
+    : np ? "関節を固定している間は「左右同時に動かす」を使えません（固定をすべて外すと使えます）。" : "";
+  for (const [id, , mn, mx, , , kind] of JOINT_CTL){
+    // the wrist joint shows the elbow's bend and the forearm; its twist is the hand joint's
+    const show = ok && (kind === "any" || (kind === "root") === root) && !(id === "jTwist" && /_wrist$/.test(J[sel]));
+    $(id + "Row").style.display = show ? "" : "none";
+    if (!show) continue;
+    const v = jointValue(id), r = $(id), n = $(id + "N");
+    if (rangeHeld !== r) r.value = v;
+    if (document.activeElement !== n) n.value = Math.round(v * 10) / 10;
+  }
+}
+
+// ---- presets: bends of the standing figure ----------------------------------------------------
+// [joint, axis, degrees]: the joint's own bone and everything after it turn about its parent.
+const PRESETS = {
+  "立ち（標準）": [],
+  "Aポーズ": [["r_elbow","z",-35],["l_elbow","z",35]],
+  "Tポーズ": [["r_elbow","z",-90],["l_elbow","z",90]],
+  "コントラポスト": [["l_knee","x",-12],["l_ankle","x",22],["r_elbow","z",-8],["l_elbow","x",-15],["l_wrist","x",-60],["chest","z",-4]],
+  "歩く": [["r_knee","x",-25],["r_ankle","x",15],["l_knee","x",20],["l_ankle","x",25],["r_elbow","x",20],["l_elbow","x",-22],["l_wrist","x",-30]],
+  "走る": [["r_knee","x",-55],["r_ankle","x",70],["l_knee","x",35],["l_ankle","x",60],["r_elbow","x",45],["r_wrist","x",-90],["l_elbow","x",-50],["l_wrist","x",-80],["chest","x",-10]],
+  "椅子に座る": [["r_knee","x",-90],["r_ankle","x",90],["l_knee","x",-90],["l_ankle","x",90],["r_wrist","x",-60],["l_wrist","x",-60]],
+  "しゃがむ": [["r_knee","x",-120],["r_ankle","x",145],["l_knee","x",-120],["l_ankle","x",145],["chest","x",-25],["r_wrist","x",-70],["l_wrist","x",-70]],
+  "ジャンプ（バンザイ）": [["r_elbow","z",-160],["l_elbow","z",160],["r_knee","x",-30],["r_ankle","x",55],["l_knee","x",-30],["l_ankle","x",55]],
+  "ファイティングポーズ": [["r_knee","z",-12],["l_knee","z",12],["l_knee","x",-15],["r_elbow","x",-45],["r_wrist","x",-110],["l_elbow","x",-60],["l_wrist","x",-115]],
+  "腰に手": [["r_elbow","z",-35],["r_wrist","z",95],["l_elbow","z",35],["l_wrist","z",-95]],
+};
+const AXES = {x: [1,0,0], y: [0,1,0], z: [0,0,1]};
+function applyPreset(name){
+  S.P = REST.map(p => p.slice()); S.body = {yaw: 0, pitch: 0, roll: 0}; S.twist = REST.map(() => 0);
+  for (const [joint, ax, d] of PRESETS[name]){
+    const i = IX[joint], par = PARENT[i], p = S.P[par];
+    for (const k of subtree(i)) S.P[k] = add(p, rotAxis(sub(S.P[k], p), AXES[ax], deg(d)));
+  }
+  // stand on the ground: the lowest point back at the floor
+  const low = Math.min(...S.P.map(p => p[1]));
+  if (low > 0) S.P = S.P.map(p => [p[0], p[1] - low + 2, p[2]]);
+}
+
+// ---- UI wiring ---------------------------------------------------------------------------
+const $ = id => document.getElementById(id);
+// settings this browser kept under the old name (before ODM Poser): carried over once
+try { for (const k of ["theme", "lang", "editor-v1", "editor-v1-limits"]){
+  const o = localStorage.getItem("symbolic-pose-" + k);
+  if (o !== null && localStorage.getItem("odm-poser-" + k) === null) localStorage.setItem("odm-poser-" + k, o);
+} } catch (e) {}
+// the hints under the views: open where there is room (two columns, a tall window)
+// the on-screen keys (shown on touch screens and narrow windows)
+for (const [id, key] of [["vShift", "shift"], ["vAlt", "alt"]])
+  $(id).addEventListener("click", () => { VMOD[key] = !VMOD[key]; $(id).setAttribute("aria-pressed", String(VMOD[key])); $(id).classList.toggle("on", VMOD[key]); });
+$("vUndo").addEventListener("click", undo);
+$("vRedo").addEventListener("click", redo);
+$("vSide").addEventListener("click", () => { const on = document.body.classList.toggle("show-side");
+  $("vSide").setAttribute("aria-pressed", String(on)); if (matchMedia(PHONE).matches) $("ovSide").setAttribute("aria-pressed", String(on)); draw(); });
+if (navigator.maxTouchPoints > 0 || "ontouchstart" in window || matchMedia("(any-pointer: coarse)").matches)
+  document.body.classList.add("touch");
+const UNITS = {scaleAll: 1, scaleHead: 1, scaleThick: 1, lens: 1, yaw: 1, pitch: 1, roll: 1};
+const TC = [];                        // user presets: from files (the button below) or from a mod
+$("preset").innerHTML = Object.keys(PRESETS).map(n => `<option>${n}</option>`).join("");
+// user presets: possibly thousands, so a group, a search and a list
+const esc = t => String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;");
+function setUserPresets(list){
+  TC.splice(0, TC.length, ...list);
+  $("tcCount").textContent = TC.length;
+  const groups = [...new Set(TC.map(t => t.group))].sort();
+  $("tcGroup").innerHTML = `<option value="">すべての分類</option>` + groups.map(g =>
+    `<option value="${esc(g)}">${esc(g)}（${TC.filter(t => t.group === g).length}）</option>`).join("");
+  tcFilter();
+}
+// Search in Japanese or English: preset names may mix languages and spellings
+// sitting ...), so each word of the query is looked up in a small two-language word list and
+// matches any of the forms (ひらがな = カタカナ, 全角 = 半角, 大文字 = 小文字 are folded too).
+const WORDS = [
+  ["座る 座り すわる suwari sit sitting seat seated", "座"], ["立つ 立ち たつ tachi stand standing", "立"],
+  ["寝る 寝ころび 寝転び 寝そべる ねる sleep sleeping lie lying laying reclining", "寝"],
+  ["走る 走り はしる run running dash ダッシュ", "走"], ["歩く 歩き walk walking", "歩"],
+  ["ジャンプ 跳ぶ jump jumping leap", "跳"], ["構え かまえ kamae stance ready standby スタンバイ guard", "構"],
+  ["抜刀 ばっとう battou battō draw iai 居合", "抜"], ["袈裟斬り けさぎり kesa kesagiri diagonal slash", "袈裟"],
+  ["逆袈裟斬り 逆袈裟 gyakukesa gyakukes reverse upward diagonal slash", "逆袈裟"],
+  ["突き つき tsuki thrust stab lunge", "突"], ["横薙ぎ 横なぎ yokonagi horizontal sweep slash", "横薙"],
+  ["斬り上げ 切り上げ kiriage upward upslash", "上げ"], ["斬り下ろし 切り下ろし kiriorosh downward downslash", "下ろし"],
+  ["日本刀 刀 かたな katana", "刀"], ["剣 けん ソード ロングソード sword longsword", "剣"],
+  ["銃 じゅう ガン ハンドガン ピストル gun handgun pistol firearm shooting shoot", "銃"],
+  ["膝射 ニーリング ニーリングポジション kneeling kneel knee knees", "膝"],
+  ["伏射 プローン プローンポジション prone lying-prone", "伏"],
+  ["キック 蹴り 蹴る kick kicking", "蹴"], ["パンチ 殴る 拳 punch fist fists boxing", "パンチ"],
+  ["手 ハンド hand hands gesture hyoujou", "手"], ["顔 表情 ひょうじょう face expression facial hyoujou", "顔"],
+  ["スーツ すーつ suit suits business", "スーツ"], ["アクション action", "アクション"],
+  ["戦う バトル 戦闘 battle fight fighting combat", "戦"], ["女性 女 女の子 少女 female woman girl", "女"],
+  ["男性 男 男の子 少年 male man boy", "男"], ["正面 front frontal", "正面"], ["背面 後ろ 背中 back rear behind", "背面"],
+  ["右 みぎ right", "右"], ["左 ひだり left", "左"], ["奥 深い far back deep", "奥"],
+  ["アオリ あおり 煽り 見上げ low-angle lowangle below worm", "アオリ"],
+  ["フカン 俯瞰 ふかん high-angle highangle above bird", "フカン"],
+  ["クローズアップ アップ close closeup close-up", "アップ"], ["水平 eyelevel level", "水平"],
+  ["かわいい 可愛い カワイイ kawaii cute pretty", "かわいい"], ["かっこいい カッコイイ kakkoii cool", "かっこいい"],
+  ["セクシー sexy", "セクシー"], ["マッチョ macho muscle muscular", "マッチョ"], ["ヒーロー hero", "ヒーロー"],
+  ["コミカル comical funny", "コミカル"], ["クール petitcool cool", "クール"], ["悪役 ヴィラン villain", "悪役"],
+  ["椅子 いす イス chair", "椅子"], ["ソファ ソファー couch sofa", "ソファ"], ["音楽 楽器 music instrument", "音楽"],
+  ["スポーツ sports sport", "スポーツ"], ["振り返る 振り向き turn turning looking-back", "振り"],
+  ["日常 life everyday daily", "日常"], ["魔法 magic", "魔法"], ["忍者 ninja", "忍者"], ["侍 samurai", "侍"],
+  ["片手 onehand one-hand single-hand", "片手"], ["両手 twohand two-hand both-hands", "両手"],
+  ["溜め ため charge tame windup", "溜"], ["インパクト impact hit", "インパクト"], ["武器 weapon weapons", "武器"],
+  ["盾 たて shield", "盾"], ["杖 つえ staff", "杖"], ["弓 ゆみ bow archery", "弓"], ["槍 やり spear lance", "槍"],
+  ["グリップ grip", "グリップ"], ["クランプ clamp", "クランプ"], ["体勢 姿勢 pose posture", "ポーズ"],
+  ["ポーズ pose poses", "ポーズ"], ["アニメ anime", "アニメ"], ["衣装 ファッション fashion clothing clothes", "ファッション"],
+  ["背負う バックパック backpack", "背負"], ["ダンス 踊る dance dancing", "踊"], ["飛ぶ 落ちる fly flying fall falling", "飛"],
+  ["チビ ちび chibi deformed", "チビ"], ["小道具 props prop", "小道具"], ["武術 martial", "武術"],
+];
+const foldText = t => t.normalize("NFKC").toLowerCase().replace(/[ァ-ヶ]/g, c => String.fromCharCode(c.charCodeAt(0) - 0x60));
+const WORD_FORMS = WORDS.map(([forms]) => forms.split(/\s+/).map(foldText));
+const STOP = new Set(["angle", "view", "shot", "up", "of", "the", "and", "a", "in"]);   // not searched for
+function alternatives(token){
+  const cjk = /[^\u0000-\u007f]/.test(token);
+  const exact = WORD_FORMS.filter(forms => forms.includes(token));
+  // an exact word wins ("stand" is not "standby"); otherwise a prefix either way
+  // ("sit" -> sitting, "sitting" -> sit; "female" must not pull in "male")
+  const pool = exact.length ? exact : WORD_FORMS.filter(forms => (token.length >= 2 || cjk) &&
+    forms.some(f => f.startsWith(token) || (f.length >= 3 && token.startsWith(f))));
+  const alts = new Set([token]);
+  pool.forEach(forms => forms.forEach(f => alts.add(f)));
+  return [...alts];
+}
+function tcFilter(){
+  const g = $("tcGroup").value, q = foldText($("tcSearch").value.trim());
+  const tokens = q ? q.split(/\s+/).filter(w => w && !STOP.has(w)).map(alternatives) : [];
+  const hits = [];
+  TC.forEach((t, i) => {
+    if (g && t.group !== g) return;
+    if (tokens.length){
+      const hay = t.hay || (t.hay = foldText(t.group + " " + t.name));
+      if (!tokens.every(alts => alts.some(a => hay.includes(a)))) return;
+    }
+    hits.push(i);
+  });
+  $("tcList").innerHTML = hits.slice(0, 500).map(i => `<option value="${i}">${esc(t2label(TC[i]))}</option>`).join("")
+    + (hits.length > 500 ? `<option disabled>…ほか ${hits.length - 500} 件（絞り込んでください）</option>` : "");
+}
+const t2label = t => $("tcGroup").value ? t.name : `${t.group}｜${t.name}`;
+function tcApply(i){
+  if (!(i >= 0)) return;
+  remember(); applyUserPreset(TC[i]); draw(); say(`読み込みました：${TC[i].name}`);
+}
+$("tcGroup").addEventListener("change", tcFilter);
+$("tcSearch").addEventListener("input", tcFilter);
+$("tcApply").addEventListener("click", () => tcApply(+$("tcList").value));
+$("tcList").addEventListener("dblclick", () => tcApply(+$("tcList").value));
+$("tcRandom").addEventListener("click", () => {
+  const opts = [...$("tcList").options].filter(o => !o.disabled);
+  if (!opts.length) return;
+  const o = opts[Math.floor(Math.random() * opts.length)]; $("tcList").value = o.value; tcApply(+o.value);
+});
+setUserPresets(TC);
+// the user picks their preset files (a mod can add presets too)
+$("tcLoadFile").addEventListener("click", () => $("tcFile").click());
+$("tcFile").addEventListener("change", async e => {
+  const files = [...e.target.files];
+  e.target.value = "";
+  const list = [];
+  for (const f of files){
+    let items;
+    try { const data = JSON.parse(await f.text()); items = data && data.presets ? data.presets : data; }
+    catch (err) { say(`読めないファイル：${f.name}`, true); return; }
+    for (const p of Array.isArray(items) ? items : [])
+      if (p && Array.isArray(p.P)) list.push({group: String(p.group || f.name.replace(/\.json$/i, "")), name: String(p.name || ""), P: p.P});
+  }
+  setUserPresets(list); say(`ユーザープリセットを ${list.length} 件読み込みました。`);
+});
+// a pose read from a picture: only its bones' directions; the body (lengths, sizes) stays
+function applyUserPreset(t){
+  const q = {P: t.P.map(p => p.slice())}; upgradeState(q);
+  const cur = S.P.map(p => p.slice()), out = S.P.map(p => p.slice()), Q = q.P;
+  for (const i of subtree(0).slice(1)){
+    const p = PARENT[i], L = len(sub(cur[i], cur[p]));
+    out[i] = add(out[p], mul(norm(sub(Q[i], Q[p])), L));
+  }
+  S.P = out; S.body = {yaw: 0, pitch: 0, roll: 0}; S.twist = REST.map(() => 0); S.pins = {};
+  if (typeof sceneAfterEdit === "function") sceneAfterEdit();
+}
+function syncUI(){
+  upgradeState(S);
+  $("hiddenDashed").checked = !!S.hiddenDashed;
+  $("torso3d").checked = S.torso3d !== false;
+  for (const [id, v] of [["lens", Math.round(S.cam.lens)], ["yaw", Math.round(S.cam.yaw)],
+      ["pitch", Math.round(S.cam.pitch)], ["roll", Math.round(S.cam.roll)]]){
+    $(id).value = v; if (document.activeElement !== $(id + "V")) $(id + "V").value = v;
+  }
+  const sc = Object.assign(fresh().scale, S.scale);
+  for (const [id, key] of [["scaleAll", "all"], ["scaleHead", "head"], ["scaleThick", "thick"]]){
+    const r = $(id), v = sc[key]; r.min = Math.min(+r.min, v); r.max = Math.max(+r.max, v);
+    r.value = v; if (document.activeElement !== $(id + "V")) $(id + "V").value = v;
+  }
+}
+// any slider in the side panel: one undo step per drag or key press (the camera's, the ruler's,
+// a mod's ...); remember() skips a step that changed nothing
+document.addEventListener("pointerdown", e => { if (e.target.matches && e.target.matches("aside input[type=range]")) remember(); }, true);
+// the slider under a finger or the mouse is not set back while it moves (draw() refreshes the panel)
+document.addEventListener("pointerdown", e => { if (e.target.matches && e.target.matches("input[type=range]")) rangeHeld = e.target; }, true);
+for (const t of ["pointerup", "pointercancel"]) document.addEventListener(t, () => { rangeHeld = null; }, true);
+document.addEventListener("keydown", e => { if (e.target.matches && e.target.matches("aside input[type=range]")
+  && /^(Arrow|Page|Home|End)/.test(e.key)) remember(); }, true);
+document.querySelectorAll("#modes button").forEach(b => b.addEventListener("click", () => {
+  mode = b.dataset.mode;
+  document.body.className = document.body.className.replace(/\bmode-\S+/, "").trim() + " mode-" + mode;   // keep touch, split ...
+  document.querySelectorAll("#modes button").forEach(x => x.classList.toggle("on", x === b)); draw();
+}));
+$("applyPreset").addEventListener("click", () => {
+  const v = $("preset").value;
+  remember(); applyPreset(v); S.pins = {};
+  if (typeof sceneAfterEdit === "function") sceneAfterEdit();
+  S.R = REST_R.slice(); S.scale = fresh().scale;
+  syncUI(); draw();
+});
+$("mirror").addEventListener("click", () => {
+  remember();
+  const P = S.P.map(p => [-p[0], p[1], p[2]]);
+  S.P = J.map((_, i) => P[MIRROR[i]]); S.R = J.map((_, i) => S.R[MIRROR[i]]);
+  S.hands = {r: S.hands.l, l: S.hands.r};
+  S.pins = Object.fromEntries(Object.entries(S.pins || {}).map(([k, q]) => [MIRROR[+k], [-q[0], q[1], q[2]]]));
+  S.body = {yaw: -S.body.yaw, pitch: S.body.pitch, roll: -S.body.roll};
+  S.twist = J.map((_, i) => -(S.twist[MIRROR[i]] || 0));
+  (S.items || []).forEach(it => { if (it.hand) it.hand = it.hand === "r" ? "l" : "r";
+    if (it.base) it.base = [-it.base[0], it.base[1], it.base[2]]; if (it.yaw) it.yaw = -it.yaw; });
+  if (S.wire && S.wire.anchor) S.wire.anchor = [-S.wire.anchor[0], S.wire.anchor[1], S.wire.anchor[2]];
+  (S.solids || []).forEach(o => { o.pos = [-o.pos[0], o.pos[1], o.pos[2]]; o.yaw = -(o.yaw || 0); });
+  syncUI(); draw();
+});
+$("undo").addEventListener("click", undo);
+$("redo").addEventListener("click", redo);
+
+// ---- back to the defaults, and the figure moved / turned as a whole --------------------------------
+// the joints laid out along dirsFrom's bones with lengthsFrom's lengths (J: a parent comes before its child)
+function withBoneLengths(dirsFrom, lengthsFrom){
+  const out = [dirsFrom[0].slice()];
+  for (let i = 1; i < J.length; i++){ const p = PARENT[i];
+    out[i] = add(out[p], mul(norm(sub(dirsFrom[i], dirsFrom[p])), len(sub(lengthsFrom[i], lengthsFrom[p])))); }
+  return out;
+}
+const floorY = () => (S.env && S.env.floor ? +S.env.floorY || 0 : 0);
+function standOnFloor(x, z){                  // the pelvis over (x, z), the lowest point on the floor
+  const P = S.P, low = Math.min(...P.map(p => p[1])), c = P[IX.pelvis];
+  S.P = P.map(p => [p[0] - c[0] + x, p[1] - low + floorY() + 2, p[2] - c[2] + z]);
+}
+$("poseReset").addEventListener("click", () => {
+  remember();
+  const old = S.P.map(p => p.slice()), c = old[IX.pelvis];
+  applyPreset("立ち（標準）"); S.P = withBoneLengths(S.P, old); standOnFloor(c[0], c[2]); S.pins = {};
+  afterEdit(); syncUI(); draw(); say("立ちポーズに戻しました（体格はそのまま）。");
+});
+$("bodyReset").addEventListener("click", () => {
+  remember();
+  S.P = withBoneLengths(S.P, REST); S.R = REST_R.slice(); S.scale = fresh().scale;
+  afterEdit(); syncUI(); draw(); say("体格を初期値に戻しました（ポーズはそのまま）。");
+});
+// the 管理 tab's 位置と向き: the hips' own controls (setJointValue pX ... bRoll), pins carried along
+const FIG_CTL = [["figX", "pX"], ["figY", "pY"], ["figZ", "pZ"], ["figYaw", "bYaw"], ["figPitch", "bPitch"], ["figRoll", "bRoll"]];
+function setFigure(key, v){
+  setJointValue(key, v);
+  for (const k of Object.keys(S.pins || {})) S.pins[k] = S.P[+k].slice();
+  afterEdit(IX.pelvis);
+}
+function figCoords(){
+  for (const [id, key] of FIG_CTL){ const v = jointValue(key), r = $(id), n = $(id + "N");
+    if (rangeHeld !== r) r.value = v; if (document.activeElement !== n) n.value = Math.round(v); }
+}
+for (const [id, key] of FIG_CTL){
+  const r = $(id), n = $(id + "N");
+  r.addEventListener("input", () => { setFigure(key, +r.value); draw(); });
+  n.addEventListener("change", () => { const v = +n.value; if (!isFinite(v)) return; remember(); setFigure(key, v); draw(); });
+}
+$("figResetPos").addEventListener("click", () => {
+  remember();
+  for (const k of ["bYaw", "bPitch", "bRoll"]) setJointValue(k, 0);
+  standOnFloor(0, 0);
+  for (const k of Object.keys(S.pins || {})) S.pins[k] = S.P[+k].slice();
+  afterEdit(IX.pelvis); draw(); say("人物の位置と向きを戻しました。");
+});
+$("resetFigure").addEventListener("click", () => {
+  remember();
+  const f = fresh();
+  for (const k of ["P", "R", "hands", "head", "body", "twist", "pins", "scale"]) S[k] = f[k];
+  afterEdit(); syncUI(); draw(); say("この人物を初期状態に戻しました（持ち物とオーラはそのまま）。");
+});
+$("resetAll").addEventListener("click", () => {
+  if (!confirm("人物・小物・物体・床と壁・定規・カメラを、すべて最初の状態に戻します（「元に戻す」で取り消せます）。")) return;
+  remember();
+  const cams = S.cams;
+  S = fresh(); S.cams = Array.isArray(cams) ? cams : [];
+  syncUI(); draw(); say("すべて最初の状態に戻しました（記憶したカメラは残しました）。");
+});
+$("rulerReset").addEventListener("click", () => {
+  remember();
+  const on = !!(S.ruler && S.ruler.on);
+  S.ruler = Object.assign(JSON.parse(JSON.stringify(fresh().ruler)), {on});
+  syncUI(); draw(); say("定規を初期値に戻しました。");
+});
+$("symToL").addEventListener("click", () => symmetrizeLimbs("r"));
+$("symToR").addEventListener("click", () => symmetrizeLimbs("l"));
+for (const [id, whole] of [["symJoint", false], ["symLimb", true]])
+  $(id).addEventListener("click", () => { if (sel < 0 || MIRROR[sel] === sel) return;
+    remember(); symmetrize(sel, whole); afterEdit(); draw(); say("反対側をそろえました。"); });
+for (const [id, set] of [["lens", v => S.cam.lens = v], ["yaw", v => S.cam.yaw = v], ["pitch", v => S.cam.pitch = v],
+    ["roll", v => S.cam.roll = v]]){
+  $(id).addEventListener("input", e => { set(+e.target.value); syncUI(); draw(); });
+}
+$("camReset").addEventListener("click", () => { remember(); S.cam = fresh().cam; syncUI(); draw(); });
+for (const [id, key, fn] of [["scaleAll", "all", scaleAbout], ["scaleHead", "head", scaleHead],
+    ["scaleThick", "thick", k => { S.R = S.R.map(r => r * k); }]]){
+  $(id).addEventListener("pointerdown", remember);
+  $(id).addEventListener("input", e => {
+    const sc = S.scale = Object.assign(fresh().scale, S.scale);
+    const v = +e.target.value; fn(v / sc[key]); sc[key] = v;
+    if (document.activeElement !== $(id + "V")) $(id + "V").value = v; draw();
+  });
+}
+// a number typed next to a slider moves the slider (beyond its ends too, for the scales)
+for (const id of Object.keys(UNITS)){
+  $(id + "V").addEventListener("change", e => {
+    const v = +e.target.value; if (!isFinite(v)) return;
+    remember(); const r = $(id);
+    if (id.startsWith("scale")){ r.min = Math.min(+r.min, v); r.max = Math.max(+r.max, v); }
+    r.value = v; r.dispatchEvent(new Event("input"));
+  });
+}
+$("heightN").addEventListener("change", e => {
+  const v = +e.target.value; if (!(v > 20)) return;
+  remember(); scaleAbout(v / standingHeight()); draw();
+});
+buildJointPanel();
+$("handSel").innerHTML = Object.keys(HANDS).map(k => `<option value="${k}">${HAND_JA[k]}（${k}）</option>`).join("");
+$("handSel").addEventListener("change", e => { if (sel < 0) return; remember(); S.hands[J[sel][0]] = e.target.value; draw(); });
+$("pin").addEventListener("change", () => { if (sel < 0) return; remember(); togglePin(sel); draw(); });
+$("sexF").addEventListener("click", () => { remember(); applySex("female"); draw(); say("女性の体格にしました。"); });
+$("sexM").addEventListener("click", () => { remember(); applySex("male"); draw(); say("男性の体格にしました。"); });
+for (const id of ["W", "H"]) $(id).addEventListener("change", draw);
+window.addEventListener("resize", draw);
+
+// ---- files ------------------------------------------------------------------------------
+// the largest canvas this device draws (iOS / iPadOS: about 16.7 megapixels; others vary): the
+// picture keeps its ratio and gets smaller, and the status line says so
+function exportCanvas(){
+  let [W, H] = exportSize();
+  const cv = document.createElement("canvas");
+  for (let k = 0; k < 8; k++){
+    cv.width = W; cv.height = H;
+    const ctx = cv.getContext("2d");
+    if (ctx){ ctx.fillStyle = "#000"; ctx.fillRect(W - 1, H - 1, 1, 1);
+      try { if (ctx.getImageData(W - 1, H - 1, 1, 1).data[3] === 255) break; } catch (e) {} }
+    W = Math.floor(W * 0.8); H = Math.floor(H * 0.8);
+  }
+  const [W0, H0] = exportSize(); frameAspect = W0 / H0;
+  if (W !== W0) setTimeout(() => say(`この端末では ${W0}×${H0} を描けないため、${W}×${H} にしました。`, true), 0);
+  cv.getContext("2d").clearRect(0, 0, W, H);
+  return [cv, W, H];
+}
+function render(kind){
+  const [cv, W, H] = exportCanvas();
+  const ctx = cv.getContext("2d");
+  if (kind === "openpose") drawOpenpose(ctx, W, H);
+  else { ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, W, H);
+    drawAtari(ctx, W, H, {ink: "#1a1a1a", far: "#8a8a8a", bg: "#ffffff", export: true}); }
+  return cv.toDataURL("image/png");
+}
+// the composition as seen in the front view, at the export size: the chosen parts, the ruler
+// (pose_ruler.js) and a white, clear or screen-coloured background
+function renderComposition(){
+  const [cv, W, H] = exportCanvas();
+  const ctx = cv.getContext("2d"), bg = $("cmBg").value, on = id => $(id).checked;
+  const theme = bg === "theme";
+  if (bg !== "clear"){ ctx.fillStyle = theme ? cssVar("--stage") : "#ffffff"; ctx.fillRect(0, 0, W, H); }
+  if (on("cmRuler") && typeof drawRuler === "function") drawRuler(ctx, W, H, {export: true, force: true});
+  drawAtari(ctx, W, H, Object.assign(theme ? {} : {ink: "#1a1a1a", far: "#8a8a8a", bg: "#ffffff"},
+    {export: true, noFigure: !on("cmFigure"), noItems: !on("cmItems"), noSolids: !on("cmSolids"), noAuras: !on("cmAuras"),
+     showEnv: on("cmEnv"), showSolids: on("cmSolids"), flat: bg === "clear"}));
+  return cv.toDataURL("image/png");
+}
+// the export size from a ratio ("3:4") and the long side
+function applyRatio(){
+  const r = $("ratio").value;
+  $("ratioCustom").style.display = r === "custom" ? "" : "none";
+  if (!r) return;
+  const [a, b] = r === "custom" ? [+$("ratioW").value, +$("ratioH").value] : r.split(":").map(Number);
+  if (!(a > 0 && b > 0)) return;
+  const L = Math.max(256, Math.min(8192, +$("longSide").value || 1920));
+  const w = a >= b ? L : L * a / b, h = a >= b ? L * b / a : L;
+  $("W").value = Math.max(64, Math.round(w)); $("H").value = Math.max(64, Math.round(h)); draw();
+}
+for (const id of ["ratio", "longSide", "ratioW", "ratioH"]) $(id).addEventListener("change", applyRatio);
+for (const id of ["W", "H"]) $(id).addEventListener("input", () => { $("ratio").value = ""; $("ratioCustom").style.display = "none"; });
+// saving: a blob link (big data URLs fail in some browsers); iOS / iPadOS show it to save or share
+// a picture is shown whole first (#savePreview) and saved only when 保存する is pressed
+function download(url, name){
+  if (/\.png$/i.test(name) && !download.sure){
+    const dlg = $("savePreview"), img = $("spImg");
+    img.src = url; $("spInfo").textContent = name;
+    img.onload = () => { $("spInfo").textContent = `${name}（${img.naturalWidth}×${img.naturalHeight}）`; };
+    const done = save => { dlg.close(); $("spSave").onclick = $("spCancel").onclick = null;
+      if (save){ download.sure = true; try { download(url, name); } finally { download.sure = false; } }
+      else say("保存をやめました。"); };
+    $("spSave").onclick = () => done(true); $("spCancel").onclick = () => done(false);
+    dlg.oncancel = e => { e.preventDefault(); done(false); };
+    dlg.showModal(); $("spSave").focus();
+    return;
+  }
+  // the app (src-tauri) has no download links: it gives the bytes to its "save as" dialog (ODM_APP_SAVE)
+  if (window.ODM_APP_SAVE){
+    fetch(url).then(r => r.blob()).then(b => window.ODM_APP_SAVE(b, name))
+      .then(saved => { if (!saved) say("保存をやめました。"); })
+      .catch(err => say("保存できませんでした：" + (err && err.message || err), true))
+      .finally(() => { if (!url.startsWith("data:")) setTimeout(() => URL.revokeObjectURL(url), 60000); });
+    return;
+  }
+  const go = href => { const a = document.createElement("a"); a.href = href; a.download = name; a.rel = "noopener";
+    document.body.appendChild(a); a.click(); a.remove(); };
+  if (!url.startsWith("data:")){ go(url); setTimeout(() => URL.revokeObjectURL(url), 60000); return; }
+  fetch(url).then(r => r.blob()).then(b => { const u = URL.createObjectURL(b); go(u); setTimeout(() => URL.revokeObjectURL(u), 60000); })
+    .catch(() => go(url));
+}
+const stamp = () => new Date().toISOString().replace(/[-:T]/g, "").slice(0, 14);
+$("saveAtari").addEventListener("click", () => { download(render("atari"), `atari_${stamp()}.png`); say("アタリ画像を保存しました。"); });
+$("saveOpenpose").addEventListener("click", () => { download(render("openpose"), `openpose_${stamp()}.png`); say("OpenPose 画像を保存しました。"); });
+$("saveComp").addEventListener("click", () => {
+  const url = renderComposition(), [W, H] = exportSize();
+  download(url, `composition_${W}x${H}_${stamp()}.png`); say(`構図を ${W}×${H} で保存しました。`); });
+$("saveJson").addEventListener("click", () => {
+  const blob = new Blob([JSON.stringify({version: 3, ...S}, null, 1)], {type: "application/json"});
+  download(URL.createObjectURL(blob), `pose_${stamp()}.json`); say("ポーズを保存しました。");
+});
+$("loadJson").addEventListener("click", () => $("file").click());
+$("file").addEventListener("change", async e => {
+  const f = e.target.files[0]; if (!f) return;
+  try { const d = JSON.parse(await f.text());
+    migrate(d);
+    if (!Array.isArray(d.P) || d.P.length !== J.length) throw new Error("形式が違います");
+    remember(); S = Object.assign(fresh(), d); syncUI(); draw(); say("ポーズを読み込みました。");
+  } catch (err) { say("読み込めませんでした：" + err.message, true); }
+  e.target.value = "";
+});
+function migrate(d){                  // version 1 had no waist joint (18 joints)
+  if (Array.isArray(d.P) && d.P.length === 18){
+    d.P.splice(1, 0, mul(add(d.P[0], d.P[1]), 0.5));
+    if (Array.isArray(d.R)) d.R.splice(1, 0, 12);
+    if (Array.isArray(d.twist)) d.twist.splice(1, 0, 0);
+  }
+  // version 2 kept the face's turn apart (head.yaw); now it is the head joint's twist
+  if (d.head && d.head.yaw){ d.twist = d.twist || REST.map(() => 0); d.twist[4] = (d.twist[4] || 0) + d.head.yaw; d.head.yaw = 0; }
+  // 19 joints: from before the hands
+  upgradeState(d);
+}
+function say(msg, warn){ $("status").textContent = msg; $("status").style.color = warn ? "var(--warn)" : ""; }
+
+// the scene alone (things, floor and walls, wire, solids), for what reads the pose downstream
+// (a mod hands it on with api.io.sceneJSON)
+function sceneOnly(){ return {items: S.items || [], env: S.env || {}, wire: S.wire || {}, solids: S.solids || []}; }
+const qs = new URLSearchParams(location.search);
+// the picture's size: from the link (?w= &h=), else this screen's own resolution (in device pixels)
+{ const px = v => Math.max(256, Math.min(8192, Math.round(v * (window.devicePixelRatio || 1))));
+  const sw = screen.width > 0 ? px(screen.width) : 1080, sh = screen.height > 0 ? px(screen.height) : 1920;
+  $("W").value = qs.get("w") || sw; $("H").value = qs.get("h") || sh;
+  $("longSide").value = Math.max(+$("W").value, +$("H").value); }
+
+// light / dark: auto follows the system; the choice is kept in this browser
+{ const KEY_T = "odm-poser-theme", LABEL = {auto: "表示：自動", light: "表示：ライト", dark: "表示：ダーク"};
+  const set = t => { if (t === "light" || t === "dark") document.documentElement.dataset.theme = t;
+    else delete document.documentElement.dataset.theme;
+    $("themeBtn").querySelector("span").textContent = LABEL[t] || LABEL.auto; draw(); };
+  let theme = "auto"; try { theme = localStorage.getItem(KEY_T) || "auto"; } catch (e) {}
+  $("themeBtn").addEventListener("click", () => {
+    theme = {auto: "light", light: "dark", dark: "auto"}[theme] || "auto";
+    try { localStorage.setItem(KEY_T, theme); } catch (e) {}
+    set(theme); });
+  matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => draw());
+  set(theme);
+}
+// the app (PWA): offline with a service worker, an "add as an app" button. Only over https or
+// from this computer (localhost): opened as a file there is no app; inside another page's frame
+// (a host page's window, such as a node editor's) neither.
+{ const top = window.top === window, secure = window.isSecureContext && location.protocol !== "file:";
+  const ua = navigator.userAgent, ios = /iPad|iPhone|iPod/.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1);
+  const macSafari = /Macintosh/.test(ua) && /Safari\//.test(ua) && !/Chrome|Chromium|Edg\/|Firefox|OPR\//.test(ua) && !ios;
+  const standalone = matchMedia("(display-mode: standalone)").matches || navigator.standalone === true;
+  if (top && secure && "serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
+  let prompt = null;
+  addEventListener("beforeinstallprompt", e => { e.preventDefault(); prompt = e; if (top) $("installBtn").hidden = false; });
+  addEventListener("appinstalled", () => { $("installBtn").hidden = true; say("アプリとして追加しました。"); });
+  if (top && secure && !standalone && (ios || macSafari)) $("installBtn").hidden = false;
+  $("installBtn").addEventListener("click", async () => {
+    if (prompt){ prompt.prompt(); const r = await prompt.userChoice; prompt = null; if (r.outcome === "accepted") $("installBtn").hidden = true; }
+    else if (ios) say("Safari の共有ボタン（□↑）→「ホーム画面に追加」で、アプリとして使えます。");
+    else if (macSafari) say("Safari のメニュー「ファイル」→「Dock に追加」で、アプリとして使えます。");
+  });
+}
+// remember the last pose in this browser only (a convenience; files are the real save)
+const KEY = "odm-poser-editor-v1";
+try { const l = localStorage.getItem(KEY + "-limits"); if (l !== null) $("limits").checked = l === "1"; } catch (e) {}
+try { $("symPose").checked = localStorage.getItem(KEY + "-sympose") === "1"; } catch (e) {}
+// the camera pad: the left stick turns the camera round the figure, the right one moves it (both
+// as a game's camera: push right, the camera goes right), the slider zooms
+function padStick(id, act){
+  const el = $(id), knob = el.firstElementChild; let v = null, raf = 0, t0 = 0;
+  const tick = t => { if (!v) return; const dt = Math.min(0.05, (t - t0) / 1000); t0 = t;
+    act(v[0], v[1], dt); camSync(); draw(); raf = requestAnimationFrame(tick); };
+  const set = e => { const r = el.getBoundingClientRect(), half = r.width / 2;
+    let dx = (e.clientX - r.left - half) / half, dy = (e.clientY - r.top - half) / half; const m = Math.hypot(dx, dy);
+    if (m > 1){ dx /= m; dy /= m; }
+    v = [dx, dy]; knob.style.transform = `translate(${dx * half * 0.6}px, ${dy * half * 0.6}px)`; };
+  el.addEventListener("pointerdown", e => { e.preventDefault(); if (camHeld()) return;
+    try { el.setPointerCapture(e.pointerId); } catch (err) {}
+    remember(); set(e); cancelAnimationFrame(raf); t0 = performance.now(); raf = requestAnimationFrame(tick); });
+  el.addEventListener("pointermove", e => { if (v) set(e); });
+  const end = () => { if (!v) return; v = null; knob.style.transform = ""; cancelAnimationFrame(raf); syncUI(); };
+  el.addEventListener("pointerup", end); el.addEventListener("pointercancel", end);
+}
+padStick("stickOrbit", (x, y, dt) => camOrbit(x * 120 * dt, -y * 90 * dt));
+padStick("stickPan", (x, y, dt) => { const H = front.height; camPan(-x * 0.6 * H * dt, -y * 0.6 * H * dt, front.width, H); });
+{ const z = $("zoomer"); let on = false;
+  const set = e => { const r = z.getBoundingClientRect(), [a, b] = zoomSpan();
+    const f = 1 - Math.max(0, Math.min(1, (e.clientY - r.top - 13) / Math.max(1, r.height - 26)));
+    S.cam.zoom = a * Math.pow(b / a, f); drawSoon(); };
+  z.addEventListener("pointerdown", e => { e.preventDefault(); if (camHeld()) return;
+    try { z.setPointerCapture(e.pointerId); } catch (err) {}
+    remember(); on = true; set(e); });
+  z.addEventListener("pointermove", e => { if (on) set(e); });
+  const end = () => { if (on){ on = false; syncUI(); } };
+  z.addEventListener("pointerup", end); z.addEventListener("pointercancel", end);
+}
+// the pad: shown on touch screens unless switched off; on a computer when switched on
+{ let pref = null; try { pref = localStorage.getItem(KEY + "-pad"); } catch (e) {}
+  document.body.classList.toggle("pad", pref ? pref === "1" : document.body.classList.contains("touch")); }
+const padKey = () => { const on = document.body.classList.contains("pad");
+  $("vPad").setAttribute("aria-pressed", String(on)); $("vPad").classList.toggle("on", on); $("padOn").checked = on; };
+const setPad = on => { document.body.classList.toggle("pad", on);
+  try { localStorage.setItem(KEY + "-pad", on ? "1" : "0"); } catch (e) {} padKey(); };
+padKey();
+$("vPad").addEventListener("click", () => setPad(!document.body.classList.contains("pad")));
+$("padOn").addEventListener("change", e => setPad(e.target.checked));
+// remembered cameras (S.cams, saved with the pose and undone with it)
+const camLabel = c => `${c.name}（向き ${Math.round(c.cam.yaw)}°・高さ ${Math.round(c.cam.pitch)}°・${Math.round(c.cam.lens)}mm・×${(+c.cam.zoom).toFixed(1)}）`;
+function syncCams(){
+  const list = S.cams = Array.isArray(S.cams) ? S.cams : [], el = $("camList"), keep = el.value;
+  el.innerHTML = list.map((c, i) => `<option value="${i}">${esc(camLabel(c))}</option>`).join("");
+  if (keep !== "" && +keep < list.length) el.value = keep;
+  $("camCount").textContent = list.length; $("camLock").checked = !!S.camLock;
+  for (const id of ["camLoad", "camDel"]) $(id).disabled = !list.length;
+  camLockUI();
+}
+for (const id of [...CAM_P, ...CAM_T]) $(id).addEventListener("change", () => {
+  if (camHeld()) return;
+  const v = ids => ids.map(k => +$(k).value);
+  if (![...v(CAM_P), ...v(CAM_T)].every(isFinite)) return;
+  remember();
+  if (CAM_T.includes(id)){ const pos = camPos(); S.center = v(CAM_T); setCamPos(pos); }
+  else if (!setCamPos(v(CAM_P))) say("カメラが見る点に近すぎます。", true);
+  syncUI(); draw();
+});
+{ const sync0 = syncUI; syncUI = function(){ sync0(); syncCams(); }; }
+$("camLock").addEventListener("change", e => { remember(); S.camLock = e.target.checked; camLockUI();
+  say(S.camLock ? "カメラを固定しました（スライダー・座標も動きません。「呼出」は使えます）。" : "カメラの固定を外しました。"); });
+$("camSave").addEventListener("click", () => {
+  remember(); S.cams = Array.isArray(S.cams) ? S.cams : [];
+  let n = S.cams.length + 1; while (S.cams.some(c => c.name === `カメラ${n}`)) n++;
+  S.cams.push({name: `カメラ${n}`, cam: Object.assign({}, S.cam), center: S.center.slice()});
+  syncCams(); $("camList").value = String(S.cams.length - 1); say(`カメラ${n}として記憶しました。`);
+});
+const camRecall = () => { const c = (S.cams || [])[+$("camList").value]; if (!c) return;
+  remember(); S.cam = Object.assign({}, S.cam, c.cam); S.center = c.center.slice(); syncUI(); draw(); say(`${c.name}を呼び出しました。`); };
+$("camLoad").addEventListener("click", camRecall);
+$("camList").addEventListener("dblclick", camRecall);
+$("camDel").addEventListener("click", () => { const i = +$("camList").value; if (!(S.cams || [])[i]) return;
+  remember(); const [c] = S.cams.splice(i, 1); syncCams(); say(`${c.name}を削除しました。`); });
+syncCams();
+// the side view (横から): right (the default), left, above, below or hidden; kept in this browser
+// The button on the view (two panes) hides it and brings it back where it was.
+{ const views = document.querySelector(".views"), el = $("sidePos"), btn = $("ovSide");
+  const set = p => { views.classList.remove("side-left", "side-top", "side-bottom", "side-hide");
+    if (p !== "right") views.classList.add("side-" + p); el.value = p;
+    // a phone shows it on request (show-side), wherever it is placed
+    btn.setAttribute("aria-pressed", String(matchMedia(PHONE).matches ? document.body.classList.contains("show-side") : p !== "hide"));
+    // twice: the front view's room is measured with the side view already at its new size
+    chromeKey = ""; draw(); chromeKey = ""; draw(); };
+  const get = (k, d) => { try { return localStorage.getItem(KEY + k) || d; } catch (e) { return d; } };
+  const put = (k, v) => { try { localStorage.setItem(KEY + k, v); } catch (e) {} };
+  const choose = v => { put("-side", v); if (v !== "hide") put("-sidelast", v); set(v); };
+  el.addEventListener("change", () => choose(el.value));
+  btn.addEventListener("click", () => {
+    // phones show it on request (the 横の図 key): the same here
+    if (matchMedia("(max-width: 700px)").matches){ $("vSide").click(); return; }
+    const show = el.value === "hide";
+    choose(show ? get("-sidelast", "right") : "hide"); toast(show ? "横の図を出しました。" : "横の図を隠しました。"); });
+  const p = get("-side", "right");
+  set(["right", "left", "top", "bottom", "hide"].includes(p) ? p : "right");
+}
+// the panel (操作欄): right (the default), left, above or below the views; kept in this browser
+// Above or below, the menu and tabs stack in a column on the left or right (メニュー) and the
+// tab's controls run across, sliders upright. Any place: the panel can be put away (しまう).
+{ const el = $("asidePos"), side = $("menuSide"), all = ["right", "left", "top", "bottom"], bc = document.body.classList;
+  const get = (k, d) => { try { return localStorage.getItem(KEY + k) || d; } catch (e) { return d; } };
+  const put = (k, v) => { try { localStorage.setItem(KEY + k, v); } catch (e) {} };
+  const redraw = () => { chromeKey = ""; draw(); chromeKey = ""; draw(); };
+  const set = p => { bc.remove("aside-left", "aside-top", "aside-bottom");
+    if (p !== "right") bc.add("aside-" + p); el.value = p; redraw(); };
+  const setSide = s => { bc.toggle("menu-right", s === "right"); side.value = s; redraw(); };
+  const setOff = off => { bc.toggle("aside-off", off); $("ovAside").setAttribute("aria-pressed", String(!off)); redraw(); };
+  el.addEventListener("change", () => { put("-aside", el.value); set(el.value); });
+  side.addEventListener("change", () => { put("-menuside", side.value); setSide(side.value); });
+  const flip = () => { const off = !bc.contains("aside-off"); put("-asideoff", off ? "1" : "0"); setOff(off); };
+  $("ovAside").addEventListener("click", () => { flip(); toast(bc.contains("aside-off") ? "操作欄をしまいました。" : "操作欄を出しました。"); });
+  const p = get("-aside", "right"); set(all.includes(p) ? p : "right");
+  setSide(get("-menuside", "left") === "right" ? "right" : "left");
+  setOff(get("-asideoff", "0") === "1");
+}
+// a message from the view's own switches: shown for a moment in the view's corner, not in the panel
+let toastTimer = 0;
+function toast(msg, warn){
+  const t = $("ovToast"); t.textContent = msg; t.classList.toggle("warn", !!warn); t.classList.add("show");
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove("show"), 2600);
+}
+// split screen: on by itself where a finger is the main pointer (phones, tablets), or as chosen
+function setSplit(on){
+  document.body.classList.toggle("split", on);
+  if (!on){ document.body.classList.remove("full"); $("vPanels").textContent = "操作欄を隠す"; }
+  $("splitBtn").setAttribute("aria-pressed", String(on)); draw();
+}
+{ let pref = null; try { pref = localStorage.getItem(KEY + "-split"); } catch (e) {}
+  setSplit(pref ? pref === "1" : matchMedia("(pointer: coarse)").matches); }
+$("splitBtn").addEventListener("click", () => { const on = !document.body.classList.contains("split");
+  try { localStorage.setItem(KEY + "-split", on ? "1" : "0"); } catch (e) {} setSplit(on); });
+$("vPanels").addEventListener("click", () => { const full = document.body.classList.toggle("full");
+  $("vPanels").textContent = full ? "操作欄を出す" : "操作欄を隠す"; draw(); });
+$("symPose").addEventListener("change", e => { try { localStorage.setItem(KEY + "-sympose", e.target.checked ? "1" : "0"); } catch (err) {}
+  if (e.target.checked && sel >= 0 && MIRROR[sel] !== sel){ remember(); afterEdit(sel); draw(); say("反対側をそろえました。"); } });
+$("torso3d").addEventListener("change", e => { remember(); S.torso3d = e.target.checked; draw();
+  toast(e.target.checked ? "胴体を立体（厚みのある台形）で描きます。" : "胴体を平らな台形で描きます。"); });
+$("hiddenDashed").addEventListener("change", e => { remember(); S.hiddenDashed = e.target.checked; draw();
+  toast(e.target.checked ? "物陰に隠れた線を破線で描きます（書き出しにも）。" : "隠れた線を破線にするのをやめました。"); });
+$("limits").addEventListener("change", e => { try { localStorage.setItem(KEY + "-limits", e.target.checked ? "1" : "0"); } catch (err) {}
+  $("limitsSide").checked = e.target.checked;
+  (e.isTrusted ? toast : say)(e.target.checked ? "関節の限界を有効にしました（これからの操作に効きます）。" : "関節の限界を無効にしました。"); });
+// the same switch in the pose panel
+$("limitsSide").checked = $("limits").checked;
+$("limitsSide").addEventListener("change", e => { $("limits").checked = e.target.checked; $("limits").dispatchEvent(new Event("change")); });
+window.addEventListener("beforeunload", () => { try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) {} });
+try { const d = JSON.parse(localStorage.getItem(KEY) || "null"); if (d && d.P){ migrate(d); if (d.P.length === J.length) S = Object.assign(fresh(), d); } } catch (e) {}
+for (const id of ["scaleAll", "scaleHead", "scaleThick"]) $(id + "V").value = 100;
+syncUI(); draw();
